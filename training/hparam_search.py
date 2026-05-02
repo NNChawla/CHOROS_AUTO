@@ -1,0 +1,665 @@
+"""
+Bayesian hyperparameter search for VR motion encoder (MAE).
+
+Uses Optuna with TPE sampler.  Each trial runs train_vr_encoder.py as an
+isolated subprocess for 5 epochs with --eval_window_pool mean --eval_session_pool mean
+(single pool for speed), then parses the epoch-5 output to extract mean ROC-AUC
+across 3 downstream objectives.
+
+Aggregate metric: unweighted mean of val ROC-AUC across
+  FAB portScore / DEVCOM bot_dist_mean_s3 / firing_accuracy_AOBJ_s3
+  (flag_incidents_s3 excluded: severe val-set class imbalance, 13/4 split)
+
+Historical baseline (v1, mean/mean pool at epoch 5): 0.5845
+
+Usage
+-----
+  # Single GPU (local SQLite):
+  conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 40
+
+  # Parallel workers on both GPUs (share one SQLite study):
+  conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 20 &
+  conda run -n CHOROS python training/hparam_search.py --gpu 1 --n_trials 20
+
+  # Distributed across machines — coordinator (spaceboi, runs Phase 2+3):
+  conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 40 \\
+      --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \\
+      --worker_offset 0
+
+  # Remote worker (add --skip_final, unique --worker_offset per machine):
+  conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 40 \\
+      --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \\
+      --worker_offset 1 --skip_final
+"""
+
+import argparse
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+
+import optuna
+import subprocess
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+_CHOROS_ROOT  = Path(__file__).parent.parent
+_TRAINING_DIR = Path(__file__).parent
+_DATA_ROOT    = Path(os.environ.get('CHOROS_DATA_ROOT', '/srv/CHOROS/data'))
+sys.path.insert(0, str(_TRAINING_DIR))
+from gpu_profiles import get_gpu_profile, print_gpu_profile, _HIGH_VRAM_GB, _detect_attn_backend
+
+import torch
+
+# ---------------------------------------------------------------------------
+# Search space definitions
+# ---------------------------------------------------------------------------
+
+# All embed_dim choices (64, 128, 192, 256) are divisible by both 4 and 8,
+# so restricting to [4, 8] avoids Optuna's CategoricalDistribution dynamic-space error.
+_N_HEADS_CHOICES = [4, 8]
+
+# Translates feature_group_mask choice to --feature_group_mask CLI args
+_FEATURE_MASK_ARGS = {
+    'none': [],
+    'P':    ['P'],
+    'V':    ['V'],
+    'A':    ['A'],
+    'J':    ['J'],
+    'PV':   ['P', 'V'],
+    'PA':   ['P', 'A'],
+    'PJ':   ['P', 'J'],
+    'VA':   ['V', 'A'],
+    'VJ':   ['V', 'J'],
+    'AJ':   ['A', 'J'],
+    'PVA':  ['P', 'V', 'A'],
+    'PVJ':  ['P', 'V', 'J'],
+    'VAJ':  ['V', 'A', 'J'],
+}
+
+# ---------------------------------------------------------------------------
+# Hyperparameter sampling
+# ---------------------------------------------------------------------------
+
+def sample_hyperparams(trial: optuna.Trial) -> dict:
+    embed_dim   = trial.suggest_categorical('embed_dim', [64, 128, 192, 256])
+    n_heads     = trial.suggest_categorical('n_heads', _N_HEADS_CHOICES)
+    mask_type   = trial.suggest_categorical('mask_type', ['random', 'span'])
+    params = {
+        'mask_ratio':          trial.suggest_float('mask_ratio', 0.15, 0.75),
+        'mask_type':           mask_type,
+        'n_span_blocks':       trial.suggest_int('n_span_blocks', 2, 8) if mask_type == 'span' else 4,
+        'feature_group_mask':  trial.suggest_categorical('feature_group_mask', ['none', 'P', 'V', 'A', 'J', 'PV', 'PA', 'PJ', 'VA', 'VJ', 'AJ', 'PVA', 'PVJ', 'VAJ']),
+        'lr':                  trial.suggest_float('lr', 1e-5, 1e-2, log=True),
+        'sampling_alpha':      trial.suggest_float('sampling_alpha', 0.05, 0.95),
+        'dropout':             trial.suggest_float('dropout', 0.0, 0.5),
+        'embed_dim':           embed_dim,
+        'n_heads':             n_heads,
+        'n_layers':            trial.suggest_int('n_layers', 2, 8),
+        'ffn_dim':             trial.suggest_categorical('ffn_dim', [256, 512, 768, 1024]),
+        'max_len':             trial.suggest_categorical('max_len', [64, 128, 256]),
+    }
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Command builder
+# ---------------------------------------------------------------------------
+
+def _profile_for_gpu(gpu_index: int) -> dict:
+    """Return GPU profile for a specific physical device index."""
+    try:
+        props   = torch.cuda.get_device_properties(gpu_index)
+        vram_gb = props.total_memory / (1024 ** 3)
+        high    = vram_gb >= _HIGH_VRAM_GB
+        precision = 'bf16' if props.major >= 8 else 'fp16'
+        backend   = _detect_attn_backend(props.major)
+        return {
+            'batch_size':   256 if high else 128,
+            'num_workers':  6 if high else 4,
+            'compile':      False,  # always off for hparam trials
+            'precision':    precision,
+            'attn_backend': backend,
+            'profile_name': 'high-VRAM' if high else 'low-VRAM',
+            'gpu_name':     props.name,
+            'vram_gb':      vram_gb,
+        }
+    except Exception:
+        return get_gpu_profile()  # fallback: query device 0
+
+
+_FIXED_SEED = 42
+
+
+def build_cmd(params: dict, gpu: int, profile: dict) -> list[str]:
+    train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder.py')
+    cmd = [
+        'conda', 'run', '-n', 'CHOROS',
+        'python', train_script,
+        '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
+        '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
+        '--epochs',             '5',
+        '--embed_eval_interval','5',
+        '--batch_size',         str(profile['batch_size']),
+        '--num_workers',        str(profile['num_workers']),
+        '--precision',          profile['precision'],
+        '--warmup_epochs',      '1',
+        '--min_lr',             '1e-6',
+        '--kinematics',         'PVAJ',
+        '--samples_per_epoch',  '65536',
+        '--seed',               str(_FIXED_SEED),
+        '--no_compile',
+        '--eval_window_pool',   'mean',
+        '--eval_session_pool',  'mean',
+        '--eval_split_mode',    'val',
+        '--mask_ratio',         str(params['mask_ratio']),
+        '--mask_type',          params['mask_type'],
+        '--n_span_blocks',      str(params['n_span_blocks']),
+        '--lr',                 str(params['lr']),
+        '--sampling_alpha',     str(params['sampling_alpha']),
+        '--dropout',            str(params['dropout']),
+        '--embed_dim',          str(params['embed_dim']),
+        '--n_heads',            str(params['n_heads']),
+        '--n_layers',           str(params['n_layers']),
+        '--ffn_dim',            str(params['ffn_dim']),
+        '--max_len',            str(params['max_len']),
+    ]
+    fgm_args = _FEATURE_MASK_ARGS[params['feature_group_mask']]
+    if fgm_args:
+        cmd += ['--feature_group_mask'] + fgm_args
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# VRAM monitoring
+# ---------------------------------------------------------------------------
+
+def _vram_monitor(gpu_id: int, peak_mb: list, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', f'--id={gpu_id}',
+                 '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5,
+            )
+            mb = int(result.stdout.strip())
+            peak_mb[0] = max(peak_mb[0], mb)
+        except Exception:
+            pass
+        stop_event.wait(5.0)
+
+
+# ---------------------------------------------------------------------------
+# Output parsing
+# ---------------------------------------------------------------------------
+
+_PROBE_SUMMARY_RE = re.compile(
+    r'\[Probe\] objective=(\w+)\s+target=(\S+)\s+split=(\w+)'
+    r'\s+Balanced Acc\.\:\s*([\d.]+)'
+    r'\s+MCC\:\s*(-?[\d.]+)'
+    r'\s+F1\(macro\)\:\s*([\d.]+)'
+    r'\s+ROC-AUC\:\s*([\d.]+)'
+)
+
+_TARGET_KEYS = frozenset([
+    'portScore',
+    'bot_dist_mean_s3',
+    'firing_accuracy_AOBJ_s3',
+])
+
+
+def parse_eval_output(text: str) -> dict[str, dict]:
+    """
+    Parse _periodic_eval() stdout.  Returns {target: {'bacc', 'mcc', 'f1', 'auc'}}
+    for each of the 3 downstream objectives, reading the compact [Probe] summary lines
+    with split=val.  flag_incidents_s3 is excluded due to severe val-set imbalance.
+    """
+    results: dict[str, dict] = {}
+    for line in text.splitlines():
+        m = _PROBE_SUMMARY_RE.search(line)
+        if m and m.group(3) == 'val':
+            target = m.group(2)
+            if target in _TARGET_KEYS:
+                results[target] = {
+                    'bacc': float(m.group(4)),
+                    'mcc':  float(m.group(5)),
+                    'f1':   float(m.group(6)),
+                    'auc':  float(m.group(7)),
+                }
+    return results
+
+
+def aggregate_metric(metrics: dict[str, dict]) -> float:
+    keys = ['portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']
+    return sum(metrics[k]['auc'] for k in keys) / 3.0
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _log_trial_summary(
+    trial: optuna.Trial,
+    params: dict,
+    score: float,
+    metrics: dict[str, dict],
+    elapsed: float,
+    peak_vram_gb: float,
+) -> None:
+    fgm  = params['feature_group_mask']
+    vram = f'{peak_vram_gb:.1f}GB' if peak_vram_gb > 0 else 'N/A'
+    def _a(key): return metrics.get(key, {}).get('auc', float('nan'))
+    print(
+        f"[T {trial.number:03d}] score={score:.4f} | "
+        f"fab={_a('portScore'):.4f} "
+        f"bot={_a('bot_dist_mean_s3'):.4f} "
+        f"firing={_a('firing_accuracy_AOBJ_s3'):.4f} | "
+        f"vram={vram} | "
+        f"mask_ratio={params['mask_ratio']:.3f} "
+        f"mask_type={params['mask_type']} "
+        f"lr={params['lr']:.2e} "
+        f"embed_dim={params['embed_dim']} "
+        f"n_heads={params['n_heads']} "
+        f"n_layers={params['n_layers']} "
+        f"ffn_dim={params['ffn_dim']} "
+        f"dropout={params['dropout']:.3f} "
+        f"max_len={params['max_len']} "
+        f"sa={params['sampling_alpha']:.3f} "
+        f"fgmask={fgm} | "
+        f"{elapsed:.0f}s",
+        flush=True,
+    )
+
+
+def _log_trial_failure(trial_number: int, params: dict, reason: str, elapsed: float) -> None:
+    fail_dir = _CHOROS_ROOT / 'outputs' / 'hparam_search'
+    fail_dir.mkdir(parents=True, exist_ok=True)
+    with open(fail_dir / 'failed_trials.log', 'a') as f:
+        f.write(f'\n[T {trial_number:03d}] FAILED ({elapsed:.0f}s) — {reason[:200]}\n')
+        f.write(f'  params: {params}\n')
+
+
+def _progress_callback(study: optuna.Study, trial: optuna.Trial) -> None:
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        return
+    best = study.best_trial
+    print(
+        f'  → running best: [T {best.number:03d}] score={best.value:.4f}  '
+        f'({len(completed)} complete)',
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optuna objective
+# ---------------------------------------------------------------------------
+
+def run_trial(trial: optuna.Trial, gpu: int, profile: dict) -> float:
+    params  = sample_hyperparams(trial)
+    cmd     = build_cmd(params, gpu, profile)
+    env     = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu)}
+
+    peak_mb    = [0]
+    stop_event = threading.Event()
+    monitor    = threading.Thread(
+        target=_vram_monitor, args=(gpu, peak_mb, stop_event), daemon=True
+    )
+    monitor.start()
+
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=1200,  # 20-minute hard cap per trial
+            env=env,
+        )
+    except subprocess.TimeoutExpired as e:
+        stop_event.set()
+        elapsed = time.time() - t0
+        _log_trial_failure(trial.number, params, 'timeout (1200s)', elapsed)
+        raise optuna.exceptions.TrialPruned()
+    finally:
+        stop_event.set()
+
+    elapsed      = time.time() - t0
+    peak_vram_gb = peak_mb[0] / 1024.0
+
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout)[-500:]
+        _log_trial_failure(trial.number, params, reason, elapsed)
+        raise optuna.exceptions.TrialPruned()
+
+    stdout  = result.stdout
+    metrics = parse_eval_output(stdout)
+
+    missing = _TARGET_KEYS - metrics.keys()
+    if missing:
+        _log_trial_failure(
+            trial.number, params,
+            f'missing metrics: {missing}',
+            elapsed,
+        )
+        raise optuna.exceptions.TrialPruned()
+
+    score = aggregate_metric(metrics)
+
+    for short, key in [('fab',    'portScore'),
+                       ('bot',    'bot_dist_mean_s3'),
+                       ('firing', 'firing_accuracy_AOBJ_s3')]:
+        m = metrics[key]
+        trial.set_user_attr(f'{short}_val_bacc', m['bacc'])
+        trial.set_user_attr(f'{short}_val_mcc',  m['mcc'])
+        trial.set_user_attr(f'{short}_val_f1',   m['f1'])
+        trial.set_user_attr(f'{short}_val_auc',  m['auc'])
+    trial.set_user_attr('elapsed_s',    round(elapsed))
+    trial.set_user_attr('peak_vram_gb', round(peak_vram_gb, 2))
+
+    _log_trial_summary(trial, params, score, metrics, elapsed, peak_vram_gb)
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Study creation
+# ---------------------------------------------------------------------------
+
+def create_study(study_name: str, worker_offset: int = 0,
+                 storage_url: str | None = None) -> optuna.Study:
+    if storage_url is None:
+        db_path = _CHOROS_ROOT / 'outputs' / 'hparam_search' / 'optuna.db'
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        storage_url = f'sqlite:///{db_path}'
+
+    sampler = optuna.samplers.TPESampler(
+        n_startup_trials=10,
+        n_ei_candidates=24,
+        seed=42 + worker_offset,
+    )
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        sampler=sampler,
+        direction='maximize',
+        load_if_exists=True,
+    )
+    return study
+
+
+# ---------------------------------------------------------------------------
+# Results export
+# ---------------------------------------------------------------------------
+
+def write_tsv_results(study: optuna.Study, out_path: Path) -> None:
+    """Write top trials to a TSV compatible with runs/results.tsv schema."""
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        return
+
+    completed.sort(key=lambda t: t.value or 0.0, reverse=True)
+    rows = []
+    for t in completed:
+        ver  = f'hps_{study.study_name}_t{t.number:03d}'
+        agg  = t.value or 0.0
+        vram = t.user_attrs.get('peak_vram_gb', 'N/A')
+        desc = (
+            f"TPE trial {t.number}, aggregate={agg:.4f}, "
+            + ', '.join(f'{k}={v}' for k, v in sorted(t.params.items()))
+        )
+        for target, col, short in [
+            ('FAB',       'portScore',               'fab'),
+            ('DEVCOM_D3', 'bot_dist_mean_s3',         'bot'),
+            ('DEVCOM_D3', 'firing_accuracy_AOBJ_s3',  'firing'),
+        ]:
+            bacc = t.user_attrs.get(f'{short}_val_bacc', float('nan'))
+            mcc  = t.user_attrs.get(f'{short}_val_mcc',  float('nan'))
+            f1   = t.user_attrs.get(f'{short}_val_f1',   float('nan'))
+            auc  = t.user_attrs.get(f'{short}_val_auc',  float('nan'))
+            perf = f'val_bacc={bacc:.4f} val_mcc={mcc:.4f} val_f1={f1:.4f} val_auc={auc:.4f}'
+            rows.append('\t'.join([ver, target, col, perf, 'hps', str(vram), desc]))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, 'w') as f:
+        f.write('version\ttarget\tobjective\tperformance\tstatus\tvram_usage\tdescription\n')
+        f.write('\n'.join(rows) + '\n')
+    print(f'\nResults written to {out_path}')
+
+
+def _print_best_trial(study: optuna.Study) -> None:
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned    = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+
+    print(f'\n{"="*72}')
+    print(f'Hyperparameter Search Complete')
+    print(f'Study: {study.study_name}   '
+          f'Trials: {len(completed)} complete, {len(pruned)} pruned')
+
+    if not completed:
+        print('No completed trials.')
+        return
+
+    best = study.best_trial
+    print(f'\nBest trial: #{best.number}   score={best.value:.4f}')
+    print(f'  FAB portScore:           auc={best.user_attrs.get("fab_val_auc", float("nan")):.4f}  '
+          f'bacc={best.user_attrs.get("fab_val_bacc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("fab_val_mcc", float("nan")):.4f}')
+    print(f'  DEVCOM bot_dist:         auc={best.user_attrs.get("bot_val_auc", float("nan")):.4f}  '
+          f'bacc={best.user_attrs.get("bot_val_bacc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("bot_val_mcc", float("nan")):.4f}')
+    print(f'  DEVCOM firing_accuracy:  auc={best.user_attrs.get("firing_val_auc", float("nan")):.4f}  '
+          f'bacc={best.user_attrs.get("firing_val_bacc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("firing_val_mcc", float("nan")):.4f}')
+    print(f'  Peak VRAM: {best.user_attrs.get("peak_vram_gb", "N/A")} GB')
+    print('  Params:')
+    for k, v in sorted(best.params.items()):
+        print(f'    {k:25s} = {v}')
+
+    print(f'\nTop 5 by aggregate score (mean val AUC):')
+    print(f'  {"Rank":4s}  {"Trial":5s}  {"score":6s}  {"fab_auc":8s}  '
+          f'{"bot_auc":8s}  {"firing_auc":10s}')
+    for rank, t in enumerate(completed[:5], 1):
+        print(
+            f'  {rank:4d}  {t.number:5d}  {(t.value or 0):.4f}  '
+            f'{t.user_attrs.get("fab_val_auc", float("nan")):.4f}      '
+            f'{t.user_attrs.get("bot_val_auc", float("nan")):.4f}      '
+            f'{t.user_attrs.get("firing_val_auc", float("nan")):.4f}'
+        )
+    print('='*72)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 + 3  (final model training and test evaluation)
+# ---------------------------------------------------------------------------
+
+def _run_streaming(cmd: list[str], env: dict) -> tuple[int, str]:
+    """Run subprocess with live stdout, return (returncode, full_stdout)."""
+    lines: list[str] = []
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+    )
+    for line in proc.stdout:
+        print(line, end='', flush=True)
+        lines.append(line)
+    proc.wait()
+    return proc.returncode, ''.join(lines)
+
+
+def build_final_cmd(params: dict, gpu: int, profile: dict, final_epochs: int) -> list[str]:
+    """Build train_vr_encoder.py command for the final model (eval_split_mode=test)."""
+    train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder.py')
+    cmd = [
+        'conda', 'run', '-n', 'CHOROS',
+        'python', train_script,
+        '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
+        '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
+        '--epochs',             str(final_epochs),
+        '--embed_eval_interval','5',
+        '--eval_split_mode',    'test',
+        '--batch_size',         str(profile['batch_size']),
+        '--num_workers',        str(profile['num_workers']),
+        '--precision',          profile['precision'],
+        '--warmup_epochs',      '2',
+        '--min_lr',             '1e-6',
+        '--kinematics',         'PVAJ',
+        '--samples_per_epoch',  '65536',
+        '--seed',               str(_FIXED_SEED),
+        '--no_compile',
+        '--eval_window_pool',   'mean',
+        '--eval_session_pool',  'mean',
+        '--mask_ratio',         str(params['mask_ratio']),
+        '--mask_type',          params['mask_type'],
+        '--n_span_blocks',      str(params.get('n_span_blocks', 4)),
+        '--lr',                 str(params['lr']),
+        '--sampling_alpha',     str(params['sampling_alpha']),
+        '--dropout',            str(params['dropout']),
+        '--embed_dim',          str(params['embed_dim']),
+        '--n_heads',            str(params['n_heads']),
+        '--n_layers',           str(params['n_layers']),
+        '--ffn_dim',            str(params['ffn_dim']),
+        '--max_len',            str(params['max_len']),
+    ]
+    fgm_args = _FEATURE_MASK_ARGS[params['feature_group_mask']]
+    if fgm_args:
+        cmd += ['--feature_group_mask'] + fgm_args
+    return cmd
+
+
+def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: int) -> None:
+    """
+    Phase 2: train a fresh model for final_epochs using the best hyperparameters,
+    evaluating on the test split every 5 epochs.
+    Phase 3: embed train+val+test with checkpoint_best and evaluate train+val→test.
+    """
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        print('\n[Final] No completed trials — skipping final evaluation.')
+        return
+
+    best   = study.best_trial
+    params = best.params
+    env    = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu)}
+
+    print(f'\n{"="*72}')
+    print(f'Phase 2: Final model — {final_epochs} epochs  (best trial #{best.number}, '
+          f'val score={best.value:.4f})')
+    print(f'{"="*72}\n')
+
+    cmd = build_final_cmd(params, gpu, profile, final_epochs)
+    rc, stdout = _run_streaming(cmd, env)
+    if rc != 0:
+        print(f'\n[Final] Phase 2 training failed (exit code {rc})')
+        return
+
+    run_dir = None
+    for line in stdout.splitlines():
+        if line.startswith('RUN_DIR:'):
+            run_dir = Path(line.split(':', 1)[1].strip())
+            break
+    if run_dir is None:
+        print('\n[Final] Could not parse RUN_DIR from training output — skipping Phase 3.')
+        return
+
+    ckpt = run_dir / 'checkpoint_best.pt'
+    if not ckpt.exists():
+        print(f'\n[Final] checkpoint_best.pt not found at {ckpt} — skipping Phase 3.')
+        return
+
+    print(f'\n{"="*72}')
+    print(f'Phase 3: Final test evaluation')
+    print(f'Checkpoint: {ckpt}')
+    print(f'{"="*72}\n')
+
+    embed_script = str(_CHOROS_ROOT / 'pipeline' / 'embed_target_data.py')
+    eval_targets = [
+        (str(_DATA_ROOT / 'aligned' / 'target_FAB'),       'FAB', []),
+        (str(_DATA_ROOT / 'aligned' / 'target_DEVCOM_s2'), 'D3',
+         ['bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']),
+    ]
+    for data_dir, objective, target_cols in eval_targets:
+        print(f'\n[Phase 3] {Path(data_dir).name}  objective={objective}')
+        p3_cmd = [
+            'conda', 'run', '-n', 'CHOROS',
+            'python', embed_script,
+            '--ckpt',        str(ckpt),
+            '--data_dir',    data_dir,
+            '--objective',   objective,
+            '--split_keys',  'train,val,test',
+            '--train_split', 'train+val',
+            '--eval_split',  'test',
+        ]
+        if target_cols:
+            p3_cmd += ['--target_cols'] + target_cols
+        rc, _ = _run_streaming(p3_cmd, env)
+        if rc != 0:
+            print(f'\n[Phase 3] Failed for {objective} (exit code {rc})')
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Bayesian hyperparameter search for VR encoder')
+    p.add_argument('--n_trials',       type=int, default=40,
+                   help='Number of trials to run (default: 40)')
+    p.add_argument('--gpu',            type=int, default=0,
+                   help='CUDA device index for training subprocess (default: 0)')
+    p.add_argument('--study_name',     type=str, default='baseline_v1',
+                   help='Optuna study name (default: baseline_v1)')
+    p.add_argument('--final_epochs',   type=int, default=20,
+                   help='Epochs for Phase 2 final model training (default: 20)')
+    p.add_argument('--skip_final',     action='store_true',
+                   help='Skip Phase 2+3 after search (useful for parallel workers where '
+                        'only one should run the final model)')
+    p.add_argument('--worker_offset',  type=int, default=0,
+                   help='Added to the TPE sampler seed (42 + offset) so parallel workers '
+                        'explore different regions of the search space. Use a unique value '
+                        'per machine. Default 0 preserves existing behaviour.')
+    p.add_argument('--storage',        type=str, default=None,
+                   help='SQLAlchemy storage URL for the Optuna study. Omit to use a local '
+                        'SQLite file. For distributed search across machines use a shared '
+                        'PostgreSQL URL, e.g. '
+                        'postgresql://optuna:choroshps@app.arcadea.us/optuna_choros')
+    return p.parse_args()
+
+
+def main():
+    args    = parse_args()
+    profile = _profile_for_gpu(args.gpu)
+    print_gpu_profile(profile)
+    study   = create_study(args.study_name, args.worker_offset, args.storage)
+
+    existing = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    print(f'Study: {args.study_name}')
+    print(f'Existing completed trials: {existing}')
+    print(f'GPU: {args.gpu}   Trials to run: {args.n_trials}')
+
+    import functools
+    objective = functools.partial(run_trial, gpu=args.gpu, profile=profile)
+
+    t_start = time.time()
+    try:
+        study.optimize(
+            objective,
+            n_trials=args.n_trials,
+            callbacks=[_progress_callback],
+            catch=(Exception,),
+        )
+    except KeyboardInterrupt:
+        print('\nInterrupted. Saving results...')
+
+    total_s = time.time() - t_start
+    h, m, s = int(total_s // 3600), int((total_s % 3600) // 60), int(total_s % 60)
+    print(f'\nTotal runtime: {h:02d}:{m:02d}:{s:02d}')
+
+    out_path = _CHOROS_ROOT / 'outputs' / 'hparam_search' / f'{args.study_name}_results.tsv'
+    write_tsv_results(study, out_path)
+    _print_best_trial(study)
+
+    if not args.skip_final:
+        run_final_phase(study, args.gpu, profile, args.final_epochs)
+
+
+if __name__ == '__main__':
+    main()

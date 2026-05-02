@@ -1,0 +1,19 @@
+# Credentials — never commit
+secrets.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Large binaries / wheels
+*.whl
+utils/
+
+# Outputs and runtime artifacts
+outputs/
+*.db
+
+# Tool state
+.agents/
+.codex/

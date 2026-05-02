@@ -1,0 +1,52 @@
+Probe Classification: Class Distributions by Split
+======================================================================
+
+Binary labels are defined by the population median computed across all
+participants in the combined train + val + test pool. The >= operator
+is used throughout (values at the median are assigned to class 1).
+Stratification in splits.py uses the same operator and the same
+reference median, so stratification labels and probe labels are
+identical. The split seed is 42.
+
+DEVCOM splits: 40 runs total (38 scored, 2 unscored forced to train).
+  -> 28 train / 6 val / 6 test  (~70/15/15).
+  Unscored runs (12, 16) have no probe labels and are excluded from
+  individual counts.
+
+FAB splits: 96 participants -> 67 train / 14 val / 15 test (~70/15/15).
+
+----------------------------------------------------------------------
+DEVCOM  |  firing_accuracy_AOBJ_s3
+Population median (scored runs): 0.2047
+Class 0 = low  (firing_acc <  0.2047)
+Class 1 = high (firing_acc >= 0.2047)
+
+  Split    Runs   Indivs   Runs c0   Runs c1   Indiv c0   Indiv c1
+  ------  -----  -------  --------  --------  ---------  ---------
+  train      28       80        15        13         39         41
+  val         6       16         3         3          8          8
+  test        6       17         3         3          7         10
+
+----------------------------------------------------------------------
+DEVCOM  |  bot_dist_mean_s3
+Population median (scored runs): 4.1947
+Class 0 = low  (bot_dist <  4.1947)
+Class 1 = high (bot_dist >= 4.1947)
+
+  Split    Runs   Indivs   Runs c0   Runs c1   Indiv c0   Indiv c1
+  ------  -----  -------  --------  --------  ---------  ---------
+  train      28       80        14        14         33         47
+  val         6       16         3         3          7          9
+  test        6       17         4         2         10          7
+
+----------------------------------------------------------------------
+FAB  |  portScore
+Population median: 8.0000
+Class 0 = low  (portScore <  8.0000)
+Class 1 = high (portScore >= 8.0000)
+
+  Split    PIDs   Class 0   Class 1
+  ------  -----  --------  --------
+  train      67        34        33
+  val        14         6         8
+  test       15         7         8
