@@ -97,10 +97,16 @@ class VRDataset(Dataset):
         samples_per_epoch: int  = 0,
         sampling_alpha: float = 1.0,
         exclude_datasets: list[str] | None = None,
+        file_allowlist:   list | None = None,
+        verbose:          bool = True,
     ):
         npy_path = Path(npy_dir) if npy_dir else None
         if npy_path and npy_path.exists() and any(npy_path.glob('*.npy')):
-            self.files   = sorted(npy_path.glob('*.npy'))
+            all_npy = sorted(npy_path.glob('*.npy'))
+            if file_allowlist is not None:
+                allowset = set(file_allowlist)
+                all_npy = [f for f in all_npy if f in allowset]
+            self.files   = all_npy
             self.use_npy = True
             self._npy_col_idx = npy_feature_indices(feature_cols)
             # Precompute (data_byte_offset, n_rows, n_cols) for every file so
@@ -172,20 +178,27 @@ class VRDataset(Dataset):
 
         # Log expected sample distribution.
         total_wins = sum(ds_total_wins.values())
-        print(
-            f'\nDataset temperature sampling  alpha={sampling_alpha:.2f}  '
-            f'({len(ds_names)} datasets  {total_wins:,} total windows)',
-            flush=True,
-        )
-        print(f"  {'Dataset':24s}  {'Windows':>12s}  {'Share':>7s}  {'Samples/ep':>11s}")
-        print(f"  {'-'*62}")
-        for ds in sorted(ds_names, key=lambda k: -self.sampling_shares[k]):
-            share = self.sampling_shares[ds]
+        if verbose:
             print(
-                f"  {ds:24s}  {ds_total_wins[ds]:>12,d}  "
-                f"{100*share:>6.2f}%  {share * self._n:>11,.0f}"
+                f'\nDataset temperature sampling  alpha={sampling_alpha:.2f}  '
+                f'({len(ds_names)} datasets  {total_wins:,} total windows)',
+                flush=True,
             )
-        print(flush=True)
+            print(f"  {'Dataset':24s}  {'Windows':>12s}  {'Share':>7s}  {'Samples/ep':>11s}")
+            print(f"  {'-'*62}")
+            for ds in sorted(ds_names, key=lambda k: -self.sampling_shares[k]):
+                share = self.sampling_shares[ds]
+                print(
+                    f"  {ds:24s}  {ds_total_wins[ds]:>12,d}  "
+                    f"{100*share:>6.2f}%  {share * self._n:>11,.0f}"
+                )
+            print(flush=True)
+        else:
+            print(
+                f'Val pretraining set: {len(self.files):,} files  '
+                f'{len(ds_names)} datasets  {total_wins:,} total windows',
+                flush=True,
+            )
 
     @staticmethod
     def _npy_header(path: Path) -> tuple[int, int, int, bool]:
@@ -380,6 +393,28 @@ def cosine_schedule_with_warmup(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+@torch.no_grad()
+def _compute_val_loss(model, val_loader, device, amp_dtype, args, feat_mask_cols) -> float:
+    model.eval()
+    total, n = 0.0, 0
+    for x, lengths in val_loader:
+        x       = x.to(device, non_blocking=True)
+        lengths = lengths.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=device.type == 'cuda'):
+            loss = model.mae_loss(
+                x, lengths,
+                mask_ratio=args.mask_ratio,
+                mask_type=args.mask_type,
+                n_span_blocks=args.n_span_blocks,
+                feat_mask_cols=feat_mask_cols,
+            )
+        total += loss.item()
+        n += 1
+    model.train()
+    return total / n if n > 0 else float('inf')
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -474,15 +509,18 @@ def make_run_dir(base_dir: Path, args) -> Path:
     return run_dir
 
 
-def _periodic_eval(run_dir: Path, epoch: int, args):
+def _periodic_eval(run_dir: Path, epoch: int, args, use_best_ckpt: bool = False):
     """
-    Embed FAB and DEVCOM_s2 targets with checkpoint_latest using all four pool
-    configs, then run linear probes for the relevant objective metrics.
+    Embed FAB and DEVCOM_s2 targets with checkpoint_best or checkpoint_latest,
+    then run linear probes for the relevant objective metrics.
     Output is captured and printed through the active Tee logger.
     """
-    ckpt = run_dir / 'checkpoint_latest.pt'
+    ckpt_name = 'checkpoint_best.pt' if use_best_ckpt else 'checkpoint_latest.pt'
+    ckpt = run_dir / ckpt_name
     if not ckpt.exists():
-        print(f'[Eval] checkpoint_latest.pt not found — skipping epoch {epoch} eval')
+        ckpt = run_dir / 'checkpoint_latest.pt'
+    if not ckpt.exists():
+        print(f'[Eval] checkpoint not found — skipping epoch {epoch} eval')
         return
 
     embed_script = Path(__file__).parent.parent / 'pipeline' / 'embed_target_data.py'
@@ -595,12 +633,51 @@ def train(args):
         print(f'  saved to {stats_path}')
 
     # ----------------------------------------------------------------- dataset
+    # Train/val split for pretraining validation loss
+    val_loader       = None
+    _train_allowlist = None
+    _N_VAL_BATCHES   = 64
+
+    if args.val_fraction > 0:
+        all_npy = sorted(Path(npy_dir).glob('*.npy'))
+        _ds_file_groups: dict[str, list[Path]] = {}
+        for f in all_npy:
+            _ds_file_groups.setdefault(f.stem.split('_')[0], []).append(f)
+        _train_files, _val_files = [], []
+        for ds in sorted(_ds_file_groups):
+            files = _ds_file_groups[ds]
+            n_val = max(1, round(len(files) * args.val_fraction))
+            _val_files.extend(files[-n_val:])
+            _train_files.extend(files[:-n_val])
+        _train_allowlist = set(_train_files)
+        print(
+            f'Train/val split: {len(_train_files):,} train / {len(_val_files):,} val files '
+            f'({args.val_fraction:.0%} per dataset)',
+            flush=True,
+        )
+        _val_ds = VRDataset(
+            npy_dir, feature_cols,
+            max_len=args.max_len, feat_mean=mean, feat_std=std,
+            npy_dir=npy_dir,
+            samples_per_epoch=_N_VAL_BATCHES * args.batch_size,
+            sampling_alpha=args.sampling_alpha,
+            file_allowlist=_val_files,
+            verbose=False,
+        )
+        val_loader = DataLoader(
+            _val_ds, batch_size=args.batch_size,
+            shuffle=True, num_workers=2,
+            pin_memory=device.type == 'cuda',
+            drop_last=True,
+        )
+
     dataset = VRDataset(
         npy_dir, feature_cols,
         max_len=args.max_len, feat_mean=mean, feat_std=std,
         npy_dir=npy_dir, samples_per_epoch=args.samples_per_epoch,
         sampling_alpha=args.sampling_alpha,
         exclude_datasets=args.exclude_datasets,
+        file_allowlist=_train_allowlist,
     )
     loader  = DataLoader(
         dataset,
@@ -697,8 +774,15 @@ def train(args):
         avg_loss   = total_loss / n_batches
         lr_now     = scheduler.get_last_lr()[0]
         epoch_secs = time.perf_counter() - t0
-        print(f'Epoch {epoch:3d}/{args.epochs}  loss={avg_loss:.6f}  lr={lr_now:.2e}  '
-              f'time={epoch_secs:.1f}s')
+        if val_loader is not None:
+            val_loss = _compute_val_loss(model, val_loader, device, amp_dtype, args, feat_mask_cols)
+            print(f'Epoch {epoch:3d}/{args.epochs}  train={avg_loss:.6f}  val={val_loss:.6f}  '
+                  f'lr={lr_now:.2e}  time={epoch_secs:.1f}s')
+            checkpoint_score = val_loss
+        else:
+            print(f'Epoch {epoch:3d}/{args.epochs}  loss={avg_loss:.6f}  lr={lr_now:.2e}  '
+                  f'time={epoch_secs:.1f}s')
+            checkpoint_score = avg_loss
 
         # Save latest checkpoint every epoch
         ckpt = {
@@ -732,17 +816,20 @@ def train(args):
         }
         torch.save(ckpt, run_dir / 'checkpoint_latest.pt')
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if checkpoint_score < best_loss:
+            best_loss = checkpoint_score
             torch.save(ckpt, run_dir / 'checkpoint_best.pt')
-            print(f'  -> new best checkpoint saved (loss={best_loss:.6f})')
+            metric_label = 'val' if val_loader is not None else 'loss'
+            print(f'  -> new best checkpoint saved ({metric_label}={best_loss:.6f})')
 
         if args.embed_eval_interval > 0 and epoch % args.embed_eval_interval == 0:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            _periodic_eval(run_dir, epoch, args)
+            _periodic_eval(run_dir, epoch, args,
+                           use_best_ckpt=getattr(args, 'eval_use_best_ckpt', False))
 
-    print(f'\nTraining complete. Best loss: {best_loss:.6f}')
+    _metric_label = 'val' if val_loader is not None else 'loss'
+    print(f'\nTraining complete. Best {_metric_label}: {best_loss:.6f}')
     print(f'Run dir  : {run_dir}')
     print(f'Finished : {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
@@ -829,6 +916,12 @@ def parse_args():
                    help="Activates split-aware periodic eval. "
                         "'val': embed train+val, probe train→val (Phase 1 / hparam search). "
                         "'test': embed all splits, probe train+val→test (Phase 2/3).")
+    p.add_argument('--val_fraction', type=float, default=0.1,
+                   help='Fraction of files per dataset held out as a pretraining validation set '
+                        'for checkpoint_best.pt selection. 0 disables (default: 0.1)')
+    p.add_argument('--eval_use_best_ckpt', action='store_true', default=False,
+                   help='Use checkpoint_best.pt instead of checkpoint_latest.pt for periodic '
+                        'downstream evals (use in hparam search; default: False)')
     args = p.parse_args()
     args._gpu_profile = _profile
     return args

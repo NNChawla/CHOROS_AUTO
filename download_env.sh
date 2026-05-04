@@ -18,14 +18,15 @@ sudo apt-get install -y sshpass
 
 mkdir -p /workspace/outputs
 
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/outputs/hparam_search outputs/hparam_search
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/pipeline pipeline
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/training training
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/src src
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/utils utils
-sshpass -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/setup setup
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/outputs/hparam_search outputs/hparam_search
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/pipeline pipeline
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/training training
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/src src
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/utils utils
+sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/setup setup
 
 FLASH_ATTN_WHEEL=/workspace/utils/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl bash setup/setup_env.sh
+rm -r srv/CHOROS_AUTO
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate CHOROS
@@ -40,7 +41,7 @@ print(int(hashlib.sha256(h).hexdigest()[:4], 16) % 9000 + 1)
 ")
 echo "Worker offset: ${WORKER_OFFSET}  (derived from hostname: $(hostname))"
 
-python training/hparam_search.py --gpu 0 --n_trials 100 \
+python training/hparam_search.py --gpu 0 --n_trials 2000 --study_name baseline_v3 \
     --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \
     --worker_offset "${WORKER_OFFSET}" \
     --skip_final

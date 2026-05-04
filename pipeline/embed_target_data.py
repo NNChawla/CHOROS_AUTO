@@ -62,6 +62,7 @@ sys.path.insert(0, str(_CHOROS_ROOT / 'src'))
 from vr_encoder import VREncoder, FEATURE_COLS, N_FEATURES
 from features import build_feature_cols
 from vr_encoder_tsjepa import TSJEPA
+from vr_encoder_pose_jepa import PoseJEPA
 
 # Four pool configurations run on every invocation.
 POOL_CONFIGS = [
@@ -88,7 +89,21 @@ def load_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, d
     cfg   = ckpt['args']
     state = ckpt['model_state']
 
-    if any(k.startswith('context_encoder.') for k in state):
+    if 'patch_size' in cfg:
+        model = PoseJEPA(
+            n_features=cfg['n_features'],
+            patch_size=cfg['patch_size'],
+            embed_dim=cfg['embed_dim'],
+            n_heads=cfg['n_heads'],
+            n_layers=cfg['n_layers'],
+            ffn_dim=cfg['ffn_dim'],
+            dropout=cfg.get('dropout', 0.0),
+            max_len=cfg['max_len'],
+            pred_layers=cfg.get('pred_layers', 2),
+            pred_ffn_dim=cfg.get('pred_ffn_dim', 256),
+            embed_pool=cfg.get('embed_pool', 'mean'),
+        ).to(device)
+    elif any(k.startswith('context_encoder.') for k in state):
         model = TSJEPA(
             n_features=cfg['n_features'],
             embed_dim=cfg['embed_dim'],
@@ -154,6 +169,18 @@ def _model_hidden_states(
     x_b:          torch.Tensor,
     padding_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(model, PoseJEPA):
+        B, T_frames, F = x_b.shape
+        P = model.patch_size
+        N = T_frames // P
+        x_patches = x_b[:, :N * P].reshape(B, N, P * F)
+        if padding_mask is not None:
+            patch_pad = padding_mask[:, torch.arange(N, device=x_b.device) * P]
+        else:
+            patch_pad = None
+        all_idx = torch.arange(N, device=x_b.device).unsqueeze(0).expand(B, -1)
+        return model.context_encoder(x_patches, all_idx, patch_pad)
+
     if isinstance(model, TSJEPA):
         T = x_b.shape[1]
         all_positions = torch.arange(T, device=x_b.device)
@@ -179,7 +206,7 @@ def _model_layer_avg_states(
     padding_mask: torch.Tensor | None,
     n_layers_avg: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(model, TSJEPA):
+    if isinstance(model, (TSJEPA, PoseJEPA)):
         layers = model.context_encoder.transformer.layers
         norm   = model.context_encoder.norm
     else:
@@ -187,7 +214,7 @@ def _model_layer_avg_states(
         norm   = model.norm
 
     selected = list(layers)[-min(n_layers_avg, len(layers)):]
-    B, T = x_b.shape[:2]
+    B = x_b.shape[0]
 
     captured: list[torch.Tensor] = []
     hooks = []
@@ -196,11 +223,27 @@ def _model_layer_avg_states(
             _c.append(out)
         hooks.append(layer.register_forward_hook(_hook))
 
-    if isinstance(model, TSJEPA):
-        T = x_b.shape[1]
-        all_positions = torch.arange(T, device=x_b.device)
+    if isinstance(model, PoseJEPA):
+        P = model.patch_size
+        T_frames = x_b.shape[1]
+        F = x_b.shape[2]
+        N = T_frames // P
+        x_patches = x_b[:, :N * P].reshape(B, N, P * F)
+        if padding_mask is not None:
+            seq_mask = padding_mask[:, torch.arange(N, device=x_b.device) * P]
+        else:
+            seq_mask = None
+        all_idx = torch.arange(N, device=x_b.device).unsqueeze(0).expand(B, -1)
+        model.context_encoder(x_patches, all_idx, seq_mask)
+        seq_len = N
+    elif isinstance(model, TSJEPA):
+        seq_len  = x_b.shape[1]
+        seq_mask = padding_mask
+        all_positions = torch.arange(seq_len, device=x_b.device)
         model.context_encoder(x_b, all_positions, padding_mask)
     else:
+        seq_len  = x_b.shape[1]
+        seq_mask = padding_mask
         model(x_b, padding_mask)
 
     for h in hooks:
@@ -209,16 +252,15 @@ def _model_layer_avg_states(
     avg_out = torch.stack(captured, dim=0).mean(0)
 
     if avg_out.dim() == 2:
-        # Flash transformer produces packed (total_valid, D); unpack to (B, 1+T, D).
-        # ContextEncoder prepends a CLS token (always valid), so the transformer sees
-        # (B, 1+T) tokens — the packed count is B + sum(~padding_mask), not sum(~padding_mask).
-        cls_col = x_b.new_zeros(B, 1, dtype=torch.bool)  # CLS is never masked
-        if padding_mask is not None:
-            full_mask = torch.cat([cls_col, padding_mask], dim=1)  # (B, 1+T)
+        # Flash transformer produces packed (total_valid, D); unpack to (B, 1+seq_len, D).
+        # ContextEncoder prepends a CLS token (always valid).
+        cls_col = x_b.new_zeros(B, 1, dtype=torch.bool)
+        if seq_mask is not None:
+            full_mask = torch.cat([cls_col, seq_mask], dim=1)
         else:
-            full_mask = x_b.new_zeros(B, 1 + T, dtype=torch.bool)
+            full_mask = x_b.new_zeros(B, 1 + seq_len, dtype=torch.bool)
         valid = ~full_mask
-        out_3d = x_b.new_zeros(B, 1 + T, avg_out.shape[-1], dtype=avg_out.dtype)
+        out_3d = x_b.new_zeros(B, 1 + seq_len, avg_out.shape[-1], dtype=avg_out.dtype)
         out_3d[valid] = avg_out
         avg_out = out_3d
 
@@ -307,8 +349,16 @@ def embed_windows(
 
         T            = max_len
         arange       = torch.arange(T, device=device).unsqueeze(0)
-        padding_mask = arange >= L_b.unsqueeze(1)
-        valid_mask   = ~padding_mask
+        padding_mask = arange >= L_b.unsqueeze(1)   # (B, T) frame-level
+
+        # For PoseJEPA the token dim is patch-level, not frame-level.
+        if isinstance(model, PoseJEPA):
+            P = model.patch_size
+            N = T // P
+            patch_arange = torch.arange(N, device=device).unsqueeze(0)
+            valid_mask   = patch_arange < (L_b // P).unsqueeze(1)   # (B, N)
+        else:
+            valid_mask = ~padding_mask
 
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             if window_pool == 'layer_avg':

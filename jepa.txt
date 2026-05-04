@@ -1,0 +1,269 @@
+Your implementation is **not just a superficial JEPA wrapper**; it has the main structural ingredients: context-only encoding, EMA target encoder, predictor queries at target positions, stop-gradient target latents, and latent Smooth-L1 loss. The largest gap is that it is still a **generic timestep-level TS-JEPA**, not yet a **Pose-JEPA** that exploits VR motion structure.
+
+---
+
+## 1. Add temporal patching instead of predicting individual timesteps
+
+Right now, the context and target units are individual frame positions. The `ContextEncoder` takes a subset of original timestep indices, projects each frame with `input_proj`, and adds sinusoidal position encodings for the original positions. 
+
+For 30 Hz pose, that is still fairly local. A Pose-JEPA should operate over short motion patches:
+
+```text id="2od5tm"
+raw frames:       B × T × F
+patchify:         B × N_patches × (patch_size × F)
+patch embedding:  B × N_patches × D
+```
+
+Recommended first settings:
+
+```text id="q58sav"
+patch_size = 8 frames   ≈ 267 ms
+or
+patch_size = 16 frames  ≈ 533 ms
+```
+
+Why it matters: predicting a single missing frame can still be close to interpolation. Predicting a latent representation of a 0.25–0.5 second motion chunk forces the model to encode movement dynamics.
+
+---
+
+## 2. Add target modes: `masked_span`, `future`, and `mixed`
+
+The current loss samples a batch-shared target mask using either random positions or contiguous spans.  That is useful, but Pose-JEPA should distinguish at least three prediction regimes:
+
+```text id="1pqo8q"
+masked_span:
+  context surrounds missing target spans
+
+future:
+  context is earlier motion
+  target is later motion
+
+mixed:
+  randomly alternate masked-span and future targets
+```
+
+Suggested API:
+
+```python id="fl852j"
+target_mode: Literal["masked_span", "future", "mixed"] = "mixed"
+future_min_gap: int = 4      # patches
+future_horizon: tuple[int, int] = (2, 8)
+```
+
+For VR motion, **future prediction is especially important** because it encourages representations of motion phase, intent, and head-hand coordination rather than just filling temporal gaps.
+
+---
+
+## 3. Make target masks per-sample, not batch-shared
+
+Your current `jepa_loss()` samples one target mask for the whole batch using `min_len`, so all samples share the same target indices. The docstring explicitly says both mask types use a batch-shared mask so slicing remains simple. 
+
+That is computationally convenient, but not ideal. It reduces masking diversity per batch and ties all samples to the shortest sequence.
+
+Better:
+
+```text id="tuy4k4"
+sample target blocks independently per sequence
+use padding/masks or packed gather to handle variable target indices
+```
+
+For fixed-length cropped windows this is not too hard. You can keep a fixed number of target patches per sample and use `torch.gather`.
+
+This would give the model more diverse prediction tasks per optimizer step.
+
+---
+
+## 4. Separate context corruption from target encoding
+
+Currently, when `feat_mask_cols` is provided, the selected feature columns are zeroed in `x_in`, and both the context branch and target branch use `x_in`. 
+
+That weakens cross-device or cross-kinematic learning. If the target encoder also sees the masked-out features, then the model is not predicting a clean latent target; it is predicting the latent of a corrupted target.
+
+For Pose-JEPA, change this:
+
+```python id="o1gzq6"
+x_context = x.clone()
+x_target = x
+
+x_context[:, :, context_masked_cols] = 0.0
+# target encoder sees clean x_target
+```
+
+Then define explicit modes:
+
+```text id="mqanm8"
+context_device_drop:
+  remove head / left / right from context only
+
+context_group_drop:
+  remove P / V / A / J from context only
+
+target remains clean:
+  target encoder sees full selected kinematic representation
+```
+
+This turns masking into a true predictive task:
+
+```text id="jwov96"
+HMD + left context → predict clean right-controller latent
+P/V context → predict clean P/V/A/J target latent
+```
+
+---
+
+## 5. Add explicit cross-device Pose-JEPA tasks
+
+The model currently treats the feature vector as flat. But your data have meaningful structure:
+
+```text id="hmvpk4"
+head
+left controller
+right controller
+```
+
+A Pose-JEPA should exploit that.
+
+Add task modes like:
+
+```text id="rmsdne"
+temporal:
+  visible time patches → target time patches
+
+cross_device:
+  HMD + left → right
+  HMD + right → left
+  HMD only → both controllers
+  controllers → HMD
+
+temporal_cross_device:
+  HMD + one controller over context window → future latent of missing controller
+```
+
+This is probably the single most “VR-specific” improvement you can make. It encourages the representation to learn head-hand coupling and bimanual coordination, which are much more HCI-relevant than reconstructing latent tokens at missing timesteps.
+
+---
+
+## 6. Add collapse diagnostics; do not rely on the docstring claim
+
+The script states that EMA stop-gradient plus predicting from a different context view “naturally prevents representational collapse” and that no variance terms are needed.  I would soften that assumption.
+
+Your implementation may be fine, but you need diagnostics.
+
+Add logging for:
+
+```text id="692m95"
+target latent mean/std
+context latent mean/std
+predicted latent mean/std
+fraction of dimensions with std < 1e-4
+embedding norm
+effective rank
+mean pairwise cosine similarity
+```
+
+Minimum version:
+
+```python id="okfe6b"
+@torch.no_grad()
+def latent_diagnostics(z):
+    # z: (B, T, D) or (B, D)
+    z = z.reshape(-1, z.shape[-1])
+    std = z.std(dim=0)
+    return {
+        "std_mean": std.mean().item(),
+        "std_min": std.min().item(),
+        "collapse_frac": (std < 1e-4).float().mean().item(),
+        "norm_mean": z.norm(dim=-1).mean().item(),
+    }
+```
+
+For a publication pipeline, I would log these every epoch.
+
+---
+
+## 7. Normalize both target and prediction consistently
+
+The current code applies `layer_norm` to the target latents inside the no-grad block before computing Smooth-L1 loss.  The predictor output is normalized by the predictor’s final `LayerNorm`, but that is not exactly the same thing as explicitly normalizing both sides at loss time.
+
+I would make this explicit:
+
+```python id="ggyswv"
+pred = F.layer_norm(pred_latents, [D])
+tgt  = F.layer_norm(tgt_latents, [D])
+loss = F.smooth_l1_loss(pred[valid], tgt[valid])
+```
+
+Or use cosine-style latent loss:
+
+```python id="poaa67"
+pred = F.normalize(pred_latents, dim=-1)
+tgt  = F.normalize(tgt_latents, dim=-1)
+loss = 2 - 2 * (pred * tgt).sum(dim=-1)
+```
+
+This makes scale behavior easier to reason about.
+
+---
+
+## 8. Add a representation pooling choice for inference
+
+Inference currently encodes the full sequence and returns only the CLS embedding.  That may work, but for time-series pose it is not obvious that CLS will be best.
+
+Add:
+
+```python id="ncuirm"
+embed_pool: Literal["cls", "mean", "mean_std", "last", "attn"] = "mean"
+```
+
+For your downstream probe pipeline, I would compare once:
+
+```text id="8cqkfw"
+CLS
+mean token pooling
+mean + std token pooling
+last token
+```
+
+My prior: **mean or mean+std pooling may beat CLS** for motion windows unless CLS is strongly trained to summarize.
+
+---
+
+## 9. Add a patch-level positional design
+
+Right now, positions are frame indices shifted by +1, with 0 reserved for CLS.  If you patchify, positions should become patch indices, not raw frame indices.
+
+I would also consider adding:
+
+```text id="54jvs0"
+relative temporal position bias
+or
+learned patch position embeddings
+```
+
+Sinusoidal is fine for v0, but relative temporal structure may be useful for motion.
+
+---
+
+## 10. Avoid `.item()` during target sampling where possible
+
+The span target sampling uses `.item()` inside the loop to get `start`.  This is probably not a major bottleneck because the mask is batch-shared and sampled once per batch, but if you move to per-sample masks, avoid Python loops and GPU syncs where possible.
+
+Not urgent, but worth addressing when refactoring masking.
+
+---
+
+## 11. Add checkpoint variants for pilot development
+
+The training script saves best by self-supervised validation loss. That is fine for final if frozen, but for development add:
+
+```text id="u4afl5"
+checkpoint_latest.pt
+checkpoint_best_jepa_val.pt
+checkpoint_best_probe_val.pt
+```
+
+Only use `best_probe_val` for pilot diagnosis, not for final test claims.
+
+---
+
+The implementation you have now is a good foundation. The conceptual leap to Pose-JEPA is to stop treating the sequence as anonymous frame vectors and start treating it as **structured embodied motion: time × body-device × kinematic abstraction**.
