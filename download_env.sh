@@ -28,20 +28,20 @@ sshpass -v -e scp -r nayan@app.arcadea.us:/srv/CHOROS_AUTO/setup setup
 FLASH_ATTN_WHEEL=/workspace/utils/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl bash setup/setup_env.sh
 rm -r srv/CHOROS_AUTO
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate CHOROS
-export CHOROS_DATA_ROOT=./srv/CHOROS/data
-
-# Derive a stable, unique seed offset from this machine's hostname so no two
-# workers explore the same TPE startup region.
-WORKER_OFFSET=$(python3 -c "
-import hashlib, socket
-h = socket.gethostname().encode()
-print(int(hashlib.sha256(h).hexdigest()[:4], 16) % 9000 + 1)
-")
-echo "Worker offset: ${WORKER_OFFSET}  (derived from hostname: $(hostname))"
-
-python training/hparam_search.py --gpu 0 --n_trials 2000 --study_name baseline_v3 \
-    --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \
-    --worker_offset "${WORKER_OFFSET}" \
-    --skip_final
+# source "$(conda info --base)/etc/profile.d/conda.sh"
+# conda activate CHOROS
+# export CHOROS_DATA_ROOT=./srv/CHOROS/data
+# 
+# # Derive a stable, unique seed offset from this machine's hostname so no two
+# # workers explore the same TPE startup region.
+# WORKER_OFFSET=$(python3 -c "
+# import hashlib, socket
+# h = socket.gethostname().encode()
+# print(int(hashlib.sha256(h).hexdigest()[:4], 16) % 9000 + 1)
+# ")
+# echo "Worker offset: ${WORKER_OFFSET}  (derived from hostname: $(hostname))"
+# 
+# python training/hparam_search.py --gpu 0 --n_trials 2000 --study_name baseline_v3 \
+#     --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \
+#     --worker_offset "${WORKER_OFFSET}" \
+#     --skip_final

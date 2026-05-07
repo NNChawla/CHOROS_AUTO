@@ -1,19 +1,16 @@
 /srv/CHOROS/data/aligned/target_DEVCOM_s2
 /srv/CHOROS/data/aligned/target_FAB
-/srv/CHOROS/data/kinematics/RW_npy_PVAJ
-/srv/CHOROS/data/kinematics/VR_npy_PVAJ
 /srv/CHOROS/data/target_objective_D3
 /srv/CHOROS/data/target_objective_FAB
-/srv/CHOROS_AUTO/src
-/srv/CHOROS_AUTO/training
-/srv/CHOROS_AUTO/pipeline
-/srv/CHOROS_AUTO/docs
+/srv/CHOROS/data/kinematics/RW_npy_PVAJ
+/srv/CHOROS/data/kinematics/VR_npy_PVAJ
+
 
 Has to be 150 gbs disk minimum
 Needs 5090, decent download speed
 
 hf upload nnchawla/CHOROS CHOROS.tar.gz CHOROS.tar.gz --repo-type dataset
-zipped with: tar -cf - /srv/CHOROS/data/aligned/target_DEVCOM_s2 /srv/CHOROS/data/aligned/target_FAB /srv/CHOROS/data/kinematics/RW_npy_PVAJ /srv/CHOROS/data/kinematics/VR_npy_PVAJ /srv/CHOROS/data/target_objective_D3 /srv/CHOROS/data/target_objective_FAB /srv/CHOROS_AUTO/src /srv/CHOROS_AUTO/training /srv/CHOROS_AUTO/pipeline /srv/CHOROS_AUTO/docs | pv -s 100G | pigz > CHOROS.tar.gz
+zipped with: tar -cf - /srv/CHOROS/data/aligned/target_DEVCOM_s2 /srv/CHOROS/data/aligned/target_FAB /srv/CHOROS/data/kinematics/RW_npy_PVAJ /srv/CHOROS/data/kinematics/RW_npy_PVAJ_index.npz /srv/CHOROS/data/kinematics/VR_npy_PVAJ_index.npz /srv/CHOROS/data/kinematics/RW_npy_PVAJ_packed.npy /srv/CHOROS/data/kinematics/VR_npy_PVAJ_packed.npy /srv/CHOROS/data/kinematics/VR_npy_PVAJ /srv/CHOROS/data/target_objective_D3 /srv/CHOROS/data/target_objective_FAB  | pv -s 100G | pigz > CHOROS.tar.gz
 
 
 to install hf cli: curl -LsSf https://hf.co/cli/install.sh | bash

@@ -135,9 +135,9 @@ def sample_hyperparams_tsjepa(trial: optuna.Trial) -> dict:
 
 
 def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
-    embed_dim   = trial.suggest_categorical('embed_dim', [64, 128, 192])
+    embed_dim   = trial.suggest_categorical('embed_dim', [192])
     n_heads     = trial.suggest_categorical('n_heads', _N_HEADS_CHOICES)
-    target_mode = trial.suggest_categorical('target_mode', ['masked_span', 'future', 'mixed'])
+    target_mode = trial.suggest_categorical('target_mode', ['masked_span'])
 
     # ffn_dim and pred_ffn_dim expressed as multiples of embed_dim so Optuna
     # reasons about them in a scale-invariant way.
@@ -156,27 +156,27 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
     )
 
     return {
-        'patch_size':       trial.suggest_categorical('patch_size', [8, 16]),
+        'patch_size':       trial.suggest_categorical('patch_size', [8, 16, 32]),
         'target_ratio':     trial.suggest_float('target_ratio', 0.35, 0.65),
         'target_mode':      target_mode,
         'n_target_blocks':  trial.suggest_int('n_target_blocks', 1, 4) if target_mode != 'future' else 2,
         'future_min_gap':   future_min_gap,
         'future_horizon':   future_horizon,
-        'ema_start':        trial.suggest_categorical('ema_start', [0.995, 0.996, 0.997, 0.998, 0.999]),
-        'pred_layers':      trial.suggest_int('pred_layers', 2, 3),
+        'ema_start':        trial.suggest_categorical('ema_start', [0.996, 0.997, 0.998, 0.999]),
+        'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
         'pred_ffn_mult':    pred_ffn_mult,
         'pred_ffn_dim':     embed_dim * pred_ffn_mult,
-        'latent_loss':      trial.suggest_categorical('latent_loss', ['smooth_l1', 'cosine']),
-        'lr':               trial.suggest_float('lr', 2e-4, 2e-3, log=True),
+        'latent_loss':      trial.suggest_categorical('latent_loss', ['smooth_l1']),
+        'lr':               trial.suggest_float('lr', 2e-5, 2e-3, log=True),
         'sampling_alpha':   trial.suggest_float('sampling_alpha', 0.4, 0.6),
-        'dropout':          0.0,
+        'dropout':          0.05,
         'embed_dim':        embed_dim,
         'n_heads':          n_heads,
         'n_layers':         trial.suggest_int('n_layers', 4, 8),
         'ffn_mult':         ffn_mult,
         'ffn_dim':          embed_dim * ffn_mult,
         # max_len in {128} — divisible by patch_size in {8, 16}
-        'max_len':          trial.suggest_categorical('max_len', [128]),
+        'max_len':          trial.suggest_categorical('max_len', [64, 128, 192, 256]),
     }
 
 
@@ -193,7 +193,7 @@ def _profile_for_gpu(gpu_index: int) -> dict:
         precision = 'bf16' if props.major >= 8 else 'fp16'
         backend   = _detect_attn_backend(props.major)
         return {
-            'batch_size':   512 if high else 128,
+            'batch_size':   512 if high else 512,
             'num_workers':  6 if high else 4,
             'compile':      False,  # always off for hparam trials
             'precision':    precision,
@@ -316,16 +316,16 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '150',
-        '--embed_eval_interval','10',
+        '--epochs',             '25',
+        '--embed_eval_interval','5',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
-        '--warmup_epochs',      str(_warmup_epochs_posejepa(10)),
+        '--warmup_epochs',      str(_warmup_epochs_posejepa(25)),
         '--val_fraction',       '0.1',
         '--min_lr',             '1e-6',
         '--kinematics',         'PVAJ',
-        '--samples_per_epoch',  '512000',
+        '--samples_per_epoch',  '262144',
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
         '--eval_window_pool',   'mean',
@@ -504,7 +504,7 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=1200,  # 20-minute hard cap per trial
+            timeout=1500,  # 25-minute hard cap per trial
             env=env,
         )
     except subprocess.TimeoutExpired as e:

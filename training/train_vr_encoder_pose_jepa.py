@@ -19,10 +19,13 @@ Key differences vs. train_vr_encoder_tsjepa.py
 
 Checkpoint files
 ----------------
-  checkpoint_latest.pt        — saved every epoch
-  checkpoint_best.pt          — best pretraining val loss (or train loss)
-  checkpoint_best_probe_val.pt — best aggregate val MCC from periodic eval
-                                 (only updated when embed_eval_interval > 0)
+  checkpoint_latest.pt              — saved every epoch
+  checkpoint_best.pt                — best pretraining val loss (or train loss)
+  checkpoint_best_probe_val.pt      — best aggregate val MCC from periodic eval
+                                      (only updated when embed_eval_interval > 0)
+  checkpoint_best_probe_<metric>_wp_<window_pool>_sp_<session_pool>.pt
+                                    — best val MCC for each individual metric
+                                      (e.g. firing, port_score, bot_dist)
 
 Usage
 -----
@@ -76,6 +79,17 @@ def npy_feature_indices(feature_cols: list[str]) -> np.ndarray:
 # Dataset  (identical to train_vr_encoder_tsjepa.py)
 # ---------------------------------------------------------------------------
 
+def _available_ram_bytes() -> int:
+    try:
+        with open('/proc/meminfo') as _f:
+            for _line in _f:
+                if _line.startswith('MemAvailable:'):
+                    return int(_line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
 class VRDataset(Dataset):
     def __init__(
         self,
@@ -97,17 +111,44 @@ class VRDataset(Dataset):
             all_npy  = [f for f in all_npy if f in allowset]
         self.files        = all_npy
         self._npy_col_idx = npy_feature_indices(feature_cols)
-        print(f'Reading npy headers for {len(self.files):,} files …', flush=True)
-        self._headers     = [self._npy_header(f) for f in self.files]
-        self._file_n_rows = [hdr[1] for hdr in self._headers]
+
+        _packed_path = npy_path.parent / f'{npy_path.name}_packed.npy'
+        _index_path  = npy_path.parent / f'{npy_path.name}_index.npz'
+        _use_packed  = False
+        if _packed_path.exists() and _index_path.exists():
+            _packed_size = _packed_path.stat().st_size
+            _avail_ram   = _available_ram_bytes()
+            if _avail_ram > _packed_size:
+                _use_packed = True
+                print(f'  Using packed mmap: {_packed_path.name}'
+                      f'  ({_packed_size/1e9:.1f} GB fits in {_avail_ram/1e9:.1f} GB available RAM)', flush=True)
+            else:
+                print(f'  Packed file ({_packed_size/1e9:.1f} GB) exceeds available RAM'
+                      f' ({_avail_ram/1e9:.1f} GB) — using per-file reads', flush=True)
+        if _use_packed:
+            _idx          = np.load(_index_path)
+            _name_to_pos  = {n: i for i, n in enumerate(_idx['names'].tolist())}
+            self._packed      = np.load(str(_packed_path), mmap_mode='r')
+            self._packed_off  = np.array([_idx['offsets'][_name_to_pos[f.name]] for f in self.files], dtype=np.int64)
+            self._file_n_rows = [int(_idx['n_rows'][_name_to_pos[f.name]]) for f in self.files]
+            self._headers     = None
+        else:
+            self._packed     = None
+            self._packed_off = None
+            print(f'Reading npy headers for {len(self.files):,} files …', flush=True)
+            self._headers     = [self._npy_header(f) for f in self.files]
+            self._file_n_rows = [hdr[1] for hdr in self._headers]
 
         if exclude_datasets:
             _excl = set(exclude_datasets)
             keep  = [i for i, f in enumerate(self.files)
                      if f.stem.split('_')[0] not in _excl]
             self.files        = [self.files[i]        for i in keep]
-            self._headers     = [self._headers[i]     for i in keep]
             self._file_n_rows = [self._file_n_rows[i] for i in keep]
+            if self._headers is not None:
+                self._headers = [self._headers[i] for i in keep]
+            if self._packed_off is not None:
+                self._packed_off = self._packed_off[keep]
             print(f'Excluded datasets: {sorted(_excl)}  ({len(self.files):,} files remain)')
 
         self.feature_cols   = feature_cols
@@ -184,34 +225,47 @@ class VRDataset(Dataset):
     def __getitem__(self, idx: int):
         ds       = random.choices(self._ds_names, cum_weights=self._ds_level_cum, k=1)[0]
         file_idx = random.choices(self._ds_groups[ds], cum_weights=self._ds_file_cum[ds], k=1)[0]
-        offset, n_rows, n_cols, fortran_order = self._headers[file_idx]
 
-        if fortran_order:
-            mmap = np.load(self.files[file_idx], mmap_mode='r')
+        if self._packed is not None:
+            n_rows = self._file_n_rows[file_idx]
+            base   = int(self._packed_off[file_idx])
+            n_cols = self._packed.shape[1]
             if n_rows >= self.max_len:
                 start  = random.randint(0, n_rows - self.max_len)
-                x      = np.array(mmap[start:start + self.max_len], dtype=np.float32)
+                x      = np.array(self._packed[base + start : base + start + self.max_len], dtype=np.float32)
                 length = self.max_len
             else:
-                x      = np.array(mmap, dtype=np.float32)
+                x      = np.array(self._packed[base : base + n_rows], dtype=np.float32)
                 length = n_rows
                 x      = np.concatenate([x, np.zeros((self.max_len - n_rows, n_cols), np.float32)])
-            del mmap
         else:
-            if n_rows >= self.max_len:
-                start    = random.randint(0, n_rows - self.max_len)
-                byte_off = offset + start * n_cols * 4
+            offset, n_rows, n_cols, fortran_order = self._headers[file_idx]
+            if fortran_order:
+                mmap = np.load(self.files[file_idx], mmap_mode='r')
+                if n_rows >= self.max_len:
+                    start  = random.randint(0, n_rows - self.max_len)
+                    x      = np.array(mmap[start:start + self.max_len], dtype=np.float32)
+                    length = self.max_len
+                else:
+                    x      = np.array(mmap, dtype=np.float32)
+                    length = n_rows
+                    x      = np.concatenate([x, np.zeros((self.max_len - n_rows, n_cols), np.float32)])
+                del mmap
             else:
-                byte_off = offset
-            with open(self.files[file_idx], 'rb') as f:
-                f.seek(byte_off)
-                x = np.fromfile(f, dtype=np.float32,
-                                count=min(n_rows, self.max_len) * n_cols).reshape(-1, n_cols)
-            if n_rows >= self.max_len:
-                length = self.max_len
-            else:
-                length = n_rows
-                x      = np.concatenate([x, np.zeros((self.max_len - n_rows, n_cols), np.float32)])
+                if n_rows >= self.max_len:
+                    start    = random.randint(0, n_rows - self.max_len)
+                    byte_off = offset + start * n_cols * 4
+                else:
+                    byte_off = offset
+                with open(self.files[file_idx], 'rb') as f:
+                    f.seek(byte_off)
+                    x = np.fromfile(f, dtype=np.float32,
+                                    count=min(n_rows, self.max_len) * n_cols).reshape(-1, n_cols)
+                if n_rows >= self.max_len:
+                    length = self.max_len
+                else:
+                    length = n_rows
+                    x      = np.concatenate([x, np.zeros((self.max_len - n_rows, n_cols), np.float32)])
 
         x = x[:, self._npy_col_idx]
 
@@ -334,11 +388,21 @@ class Tee:
         self.file.flush()
 
 
+def _short_gpu_name(gpu_name: str) -> str:
+    """Extract compact GPU identifier, e.g. '3090', 'A100' from full device name."""
+    m = re.search(r'\b(\d{4}[A-Z]?|[A-Z]\d{2,3}[A-Z]?)\b', gpu_name)
+    if m:
+        return m.group(1)
+    return 'cpu' if 'cpu' in gpu_name.lower() else gpu_name.split()[-1]
+
+
 def run_stem(args) -> str:
     ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
     dataset = Path(args.npy_dir).name
+    gpu     = _short_gpu_name(args._gpu_profile.get('gpu_name', 'cpu'))
     stem = (
         f"{ts}"
+        f"_{gpu}"
         f"_{dataset}"
         f"_posejepa"
         f"_e{args.epochs}"
@@ -360,7 +424,10 @@ def run_stem(args) -> str:
         stem += "_cdev" + "".join(d[0] for d in sorted(args.context_device_drop))
     if args.context_group_mask:
         stem += "_cgrp" + "".join(sorted(g.upper() for g in args.context_group_mask))
+    if getattr(args, 'context_group_mask_schedule', None):
+        stem += "_cgrpsched"
     stem += f"_sa{args.sampling_alpha}"
+    stem += f"_sf{args.stride_factor}"
     return stem
 
 
@@ -396,6 +463,7 @@ def make_run_dir(base_dir: Path, args) -> Path:
     print(f"  min_lr         : {args.min_lr}")
     print(f"  warmup_epochs  : {args.warmup_epochs}")
     print(f"  max_len        : {args.max_len}")
+    print(f"  stride_factor  : {args.stride_factor}")
     print(f"  target_ratio   : {args.target_ratio}")
     print(f"  n_target_blocks: {args.n_target_blocks}")
     print(f"  target_mode    : {args.target_mode}")
@@ -404,6 +472,7 @@ def make_run_dir(base_dir: Path, args) -> Path:
     print(f"  latent_loss    : {args.latent_loss}")
     print(f"  ctx_dev_drop   : {args.context_device_drop or '(none)'}")
     print(f"  ctx_grp_mask   : {args.context_group_mask or '(none)'}")
+    print(f"  ctx_grp_sched  : {args.context_group_mask_schedule or '(none)'}")
     print(f"  ema_start      : {args.ema_start}")
     print(f"  kinematics     : {args.kinematics.upper()}")
     print(f"  val_fraction   : {args.val_fraction}")
@@ -461,6 +530,40 @@ def _context_device_col_indices(args) -> list[int] | None:
     return sorted(set(cols)) if cols else None
 
 
+def _parse_group_mask_schedule(
+    schedule: list[str], kinematics: str,
+) -> list[tuple[float, list[int] | None]]:
+    """Parse --context_group_mask_schedule entries into (probability, col_indices) pairs.
+
+    Entry format: 'weight:GROUPS' where GROUPS is concatenated group letters (P/V/A/J).
+    Empty GROUPS means no masking for that outcome.  Weights are normalised to sum to 1.
+
+    Example: ['65:', '12.5:V', '12.5:AJ', '10:VAJ']
+    """
+    parsed = []
+    for entry in schedule:
+        if ':' not in entry:
+            raise ValueError(
+                f"Invalid schedule entry '{entry}'. Expected 'weight:GROUPS', "
+                f"e.g. '65:' (no mask) or '12.5:VAJ'."
+            )
+        w_str, grp_str = entry.split(':', 1)
+        weight = float(w_str)
+        if weight < 0:
+            raise ValueError(f"Negative weight in schedule entry '{entry}'.")
+        if grp_str:
+            groups = list(grp_str.upper())
+            cols = sorted(set(group_col_indices(kinematics, groups)))
+        else:
+            cols = None
+        parsed.append((weight, cols))
+
+    total = sum(w for w, _ in parsed)
+    if total <= 0:
+        raise ValueError("--context_group_mask_schedule weights must sum to a positive number.")
+    return [(w / total, cols) for w, cols in parsed]
+
+
 # ---------------------------------------------------------------------------
 # Periodic embed + probe (returns aggregate val MCC or None)
 # ---------------------------------------------------------------------------
@@ -475,10 +578,19 @@ _PROBE_SUMMARY_RE = re.compile(
 _PROBE_TARGET_KEYS = frozenset([
     'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
 ])
+_PROBE_TARGET_SHORT = {
+    'portScore':               'port_score',
+    'bot_dist_mean_s3':        'bot_dist',
+    'firing_accuracy_AOBJ_s3': 'firing',
+}
 
 
-def _parse_probe_mcc(text: str) -> float | None:
-    """Return mean val MCC across 3 targets, or None if any target is missing."""
+def _parse_probe_results(text: str) -> tuple[float | None, dict[str, float]]:
+    """Return (mean_val_mcc, per_target_mccs).
+
+    mean_val_mcc is None if any target is missing; per_target_mccs contains
+    whatever targets were found.
+    """
     mccs: dict[str, float] = {}
     for line in text.splitlines():
         m = _PROBE_SUMMARY_RE.search(line)
@@ -486,9 +598,20 @@ def _parse_probe_mcc(text: str) -> float | None:
             target = m.group(2)
             if target in _PROBE_TARGET_KEYS:
                 mccs[target] = float(m.group(5))
-    if _PROBE_TARGET_KEYS <= mccs.keys():
-        return sum(mccs.values()) / len(mccs)
-    return None
+    avg = sum(mccs.values()) / len(mccs) if _PROBE_TARGET_KEYS <= mccs.keys() else None
+    return avg, mccs
+
+
+def _probe_ckpt_suffix(args) -> str:
+    """Build filename suffix encoding window/session pool args, e.g. '_wp_mean_std_max_sp_mean'."""
+    parts = []
+    wp = getattr(args, 'eval_window_pool', None)
+    sp = getattr(args, 'eval_session_pool', None)
+    if wp:
+        parts.append(f'wp_{wp}')
+    if sp:
+        parts.append(f'sp_{sp}')
+    return ('_' + '_'.join(parts)) if parts else ''
 
 
 def _periodic_eval(
@@ -496,10 +619,11 @@ def _periodic_eval(
     epoch:   int,
     args,
     use_best_ckpt: bool = False,
-) -> float | None:
+) -> tuple[float | None, dict[str, float]]:
     """
     Embed FAB and DEVCOM_s2 targets then run linear probes.
-    Returns aggregate val MCC (float) if all 3 targets succeeded, else None.
+    Returns (aggregate_val_mcc, per_target_mccs).
+    aggregate_val_mcc is None if any of the 3 required targets is missing.
     """
     ckpt_name = 'checkpoint_best.pt' if use_best_ckpt else 'checkpoint_latest.pt'
     ckpt = run_dir / ckpt_name
@@ -507,7 +631,7 @@ def _periodic_eval(
         ckpt = run_dir / 'checkpoint_latest.pt'
     if not ckpt.exists():
         print(f'[Eval] checkpoint not found — skipping epoch {epoch} eval')
-        return None
+        return None, {}
 
     embed_script = Path(__file__).parent.parent / 'pipeline' / 'embed_target_data.py'
 
@@ -519,7 +643,7 @@ def _periodic_eval(
                              ['bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']))
     if not eval_targets:
         print(f'[Eval] no valid eval dirs — skipping epoch {epoch} eval')
-        return None
+        return None, {}
 
     print(f'\n{"="*72}')
     print(f'Periodic eval — epoch {epoch}  ckpt: {ckpt}')
@@ -542,7 +666,7 @@ def _periodic_eval(
         cmd = [sys.executable, str(embed_script),
                '--ckpt',      str(ckpt),
                '--data_dir',  data_dir,
-               '--stride',    str(args.batch_size // 2),
+               '--stride',    str(args.max_len // args.stride_factor),
                '--objective', objective,
                '--target_cols'] + target_cols
         if getattr(args, 'eval_window_pool', None):
@@ -559,7 +683,7 @@ def _periodic_eval(
     print(f'{"="*72}\n')
     sys.stdout.flush()
 
-    return _parse_probe_mcc('\n'.join(all_stdout))
+    return _parse_probe_results('\n'.join(all_stdout))
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +732,15 @@ def train(args):
     _fgm_cols = group_col_indices(args.kinematics, list(args.context_group_mask)) \
                 if args.context_group_mask else []
     feat_mask_cols = sorted(set(_fgm_cols)) or None
+
+    cgm_schedule = (
+        _parse_group_mask_schedule(args.context_group_mask_schedule, args.kinematics)
+        if args.context_group_mask_schedule else None
+    )
+    if cgm_schedule and feat_mask_cols:
+        raise ValueError(
+            "--context_group_mask and --context_group_mask_schedule are mutually exclusive."
+        )
 
     ctx_dev_cols = _context_device_col_indices(args)
 
@@ -746,10 +879,11 @@ def train(args):
     )
 
     # --------------------------------------------------------------- resume
-    best_jepa_loss  = float('inf')
-    best_probe_mcc  = float('-inf')
-    global_step     = 0
-    start_epoch     = 1
+    best_jepa_loss       = float('inf')
+    best_probe_mcc       = float('-inf')
+    best_probe_metric_mccs: dict[str, float] = {k: float('-inf') for k in _PROBE_TARGET_KEYS}
+    global_step          = 0
+    start_epoch          = 1
     if args.resume:
         print(f'Resuming from: {args.resume}')
         ckpt_r = torch.load(args.resume, map_location=device, weights_only=False)
@@ -757,8 +891,11 @@ def train(args):
         optimizer.load_state_dict(ckpt_r['optimizer_state'])
         scheduler.load_state_dict(ckpt_r['scheduler_state'])
         scaler.load_state_dict(ckpt_r['scaler_state'])
-        best_jepa_loss = ckpt_r.get('best_loss', float('inf'))
-        best_probe_mcc = ckpt_r.get('best_probe_mcc', float('-inf'))
+        best_jepa_loss         = ckpt_r.get('best_loss', float('inf'))
+        best_probe_mcc         = ckpt_r.get('best_probe_mcc', float('-inf'))
+        best_probe_metric_mccs = ckpt_r.get(
+            'best_probe_metric_mccs', {k: float('-inf') for k in _PROBE_TARGET_KEYS}
+        )
         global_step    = ckpt_r.get('global_step', 0)
         start_epoch    = ckpt_r['epoch'] + 1
         print(f'  -> epoch {ckpt_r["epoch"]} restored; resuming at epoch {start_epoch}')
@@ -785,6 +922,14 @@ def train(args):
             x       = x.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
 
+            batch_feat_mask = (
+                random.choices(
+                    [cols for _, cols in cgm_schedule],
+                    weights=[w for w, _ in cgm_schedule],
+                )[0]
+                if cgm_schedule else feat_mask_cols
+            )
+
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=device.type == 'cuda'):
                 loss, diag = model.jepa_loss(
@@ -794,7 +939,7 @@ def train(args):
                     target_mode=args.target_mode,
                     future_min_gap=args.future_min_gap,
                     future_horizon=future_horizon,
-                    feat_mask_cols=feat_mask_cols,
+                    feat_mask_cols=batch_feat_mask,
                     context_device_cols=ctx_dev_cols,
                     latent_loss=args.latent_loss,
                 )
@@ -830,7 +975,8 @@ def train(args):
 
         if val_loader is not None:
             val_loss = _compute_val_loss(
-                model, val_loader, device, amp_dtype, args, feat_mask_cols
+                model, val_loader, device, amp_dtype, args,
+                None if cgm_schedule else feat_mask_cols,
             )
             print(f'Epoch {epoch:3d}/{args.epochs}  '
                   f'train={avg_loss:.6f}  val={val_loss:.6f}  '
@@ -850,10 +996,11 @@ def train(args):
 
         # Checkpoint payload
         ckpt = {
-            'epoch':           epoch,
-            'best_loss':       best_jepa_loss,
-            'best_probe_mcc':  best_probe_mcc,
-            'global_step':     global_step,
+            'epoch':                   epoch,
+            'best_loss':               best_jepa_loss,
+            'best_probe_mcc':          best_probe_mcc,
+            'best_probe_metric_mccs':  best_probe_metric_mccs,
+            'global_step':             global_step,
             'model_state':     pose_jepa_model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'scheduler_state': scheduler.state_dict(),
@@ -880,9 +1027,11 @@ def train(args):
                 'future_min_gap':      args.future_min_gap,
                 'future_horizon':      future_horizon,
                 'latent_loss':         args.latent_loss,
-                'context_device_drop': args.context_device_drop,
-                'context_group_mask':  args.context_group_mask,
-                'feat_mask_cols':      feat_mask_cols,
+                'context_device_drop':          args.context_device_drop,
+                'context_group_mask':           args.context_group_mask,
+                'context_group_mask_schedule':  args.context_group_mask_schedule,
+                'feat_mask_cols':               feat_mask_cols,
+                'cgm_schedule':                 cgm_schedule,
                 'ctx_dev_cols':        ctx_dev_cols,
                 'sampling_alpha':      args.sampling_alpha,
                 'samples_per_epoch':   dataset._n,
@@ -901,16 +1050,26 @@ def train(args):
         if args.embed_eval_interval > 0 and epoch % args.embed_eval_interval == 0:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            probe_mcc = _periodic_eval(
+            probe_mcc, per_metric_mccs = _periodic_eval(
                 run_dir, epoch, args,
                 use_best_ckpt=getattr(args, 'eval_use_best_ckpt', False),
             )
+            pool_suffix = _probe_ckpt_suffix(args)
             if probe_mcc is not None and probe_mcc > best_probe_mcc:
                 best_probe_mcc = probe_mcc
-                ckpt['best_probe_mcc'] = best_probe_mcc   # update before saving
-                torch.save(ckpt, run_dir / 'checkpoint_best_probe_val.pt')
+                ckpt['best_probe_mcc'] = best_probe_mcc
+                torch.save(ckpt, run_dir / f'checkpoint_best_probe_val{pool_suffix}.pt')
                 print(f'  -> new best probe checkpoint saved '
                       f'(val_mcc={best_probe_mcc:.4f})')
+            for target_key, mcc in per_metric_mccs.items():
+                if mcc > best_probe_metric_mccs.get(target_key, float('-inf')):
+                    best_probe_metric_mccs[target_key] = mcc
+                    ckpt['best_probe_metric_mccs'] = best_probe_metric_mccs
+                    short = _PROBE_TARGET_SHORT.get(target_key, target_key)
+                    fname = f'checkpoint_best_probe_{short}{pool_suffix}.pt'
+                    torch.save(ckpt, run_dir / fname)
+                    print(f'  -> new best {short} checkpoint saved '
+                          f'(mcc={mcc:.4f}) -> {fname}')
 
     _metric_label = 'val' if val_loader is not None else 'loss'
     print(f'\nTraining complete. Best {_metric_label}: {best_jepa_loss:.6f}')
@@ -948,6 +1107,7 @@ def parse_args():
     p.add_argument('--min_lr',        type=float, default=1e-6)
     p.add_argument('--warmup_epochs', type=int,   default=2)
     p.add_argument('--max_len',       type=int,   default=MAX_LEN)
+    p.add_argument('--stride_factor', type=int,   default=2)
     p.add_argument('--num_workers',   type=int,   default=_profile['num_workers'])
     p.add_argument('--seed',          type=int,   default=42)
     p.add_argument('--kinematics',    type=str,   default=KINEMATICS)
@@ -992,6 +1152,12 @@ def parse_args():
                         'Valid: head left right.')
     p.add_argument('--context_group_mask', nargs='*', metavar='GROUP',
                    help='Zero kinematic group columns in context ONLY. Valid: P V A J.')
+    p.add_argument('--context_group_mask_schedule', nargs='*', metavar='ENTRY',
+                   help='Stochastic context group masking: sample a mask per batch. '
+                        'Each entry: "weight:GROUPS" where GROUPS are concatenated letters '
+                        'P/V/A/J (empty = no mask). Weights are normalised. '
+                        'Mutually exclusive with --context_group_mask. '
+                        'Example: "65:" "12.5:V" "12.5:AJ" "10:VAJ"')
 
     # EMA
     p.add_argument('--diag_interval', type=int, default=1,
@@ -1004,7 +1170,7 @@ def parse_args():
     p.add_argument('--devcom_eval_dir', type=str,
                    default=str(_DATA_ROOT / 'aligned' / 'target_DEVCOM_s2'))
     p.add_argument('--eval_window_pool',  type=str, default=None,
-                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last'])
+                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'])
     p.add_argument('--eval_session_pool', type=str, default=None,
                    choices=['mean', 'stat4'])
     p.add_argument('--eval_split_mode',   type=str, default=None,

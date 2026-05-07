@@ -12,6 +12,8 @@ Pool configurations
   2. window=mean_std_max session=mean
   3. window=layer_avg   session=mean
   4. window=mean        session=stat4
+  5. window=mean        session=mean_std_max
+  6. window=stat9       session=mean
 
 For long sequences (longer than the model's max_len window), a sliding window
 is used and per-window embeddings are produced then aggregated into a single
@@ -70,6 +72,8 @@ POOL_CONFIGS = [
     ('mean_std_max', 'mean'),
     ('layer_avg',    'mean'),
     ('mean',         'stat4'),
+    ('mean',         'mean_std_max'),
+    ('stat9',        'mean'),
 ]
 
 # Default target columns per objective (used when --target_cols is not given).
@@ -303,6 +307,39 @@ def _apply_window_pool(
         max_e  = tok_m.max(dim=1).values
         return torch.cat([mean_e, std_e, max_e], dim=-1)
 
+    if strategy == 'stat9':
+        inv_mask = ~valid_mask.unsqueeze(-1)
+        mean_e   = (token_hidden * mask_f).sum(1) / n_valid
+        diff     = (token_hidden - mean_e.unsqueeze(1)) * mask_f
+        std_e    = ((diff ** 2).sum(1) / n_valid).sqrt()
+        tok_lo   = token_hidden.masked_fill(inv_mask, float('inf'))
+        tok_hi   = token_hidden.masked_fill(inv_mask, float('-inf'))
+        min_e    = tok_lo.min(dim=1).values
+        max_e    = tok_hi.max(dim=1).values
+
+        # Percentiles: sort ascending (invalid → inf → end), index into valid range.
+        n_int      = valid_mask.long().sum(dim=1)               # (B,)
+        nf1        = (n_int.float() - 1).clamp(min=0)          # (B,)
+        sorted_v, _ = tok_lo.sort(dim=1)
+        bidx       = torch.arange(len(n_int), device=token_hidden.device)
+        p25_e      = sorted_v[bidx, (nf1 * 0.25).long()]
+        med_e      = sorted_v[bidx, (nf1 * 0.50).long()]
+        p75_e      = sorted_v[bidx, (nf1 * 0.75).long()]
+
+        # z_last - z_first (padding is always at the end, so first token is index 0)
+        last_idx = (n_int - 1).clamp(min=0)
+        first_e  = token_hidden[:, 0]
+        last_e   = token_hidden[bidx, last_idx]
+        delta_e  = last_e - first_e
+
+        # mean(|z_t - z_{t-1}|) over consecutive valid token pairs
+        consec_mask  = valid_mask[:, 1:] & valid_mask[:, :-1]  # (B, T-1)
+        abs_diffs    = (token_hidden[:, 1:] - token_hidden[:, :-1]).abs()
+        n_consec     = consec_mask.long().sum(dim=1).clamp(min=1).float().unsqueeze(-1)
+        mean_delta_e = (abs_diffs * consec_mask.float().unsqueeze(-1)).sum(1) / n_consec
+
+        return torch.cat([mean_e, std_e, min_e, max_e, p25_e, med_e, p75_e, delta_e, mean_delta_e], dim=-1)
+
     raise ValueError(f'Unknown window_pool: {strategy!r}')
 
 
@@ -320,6 +357,13 @@ def _apply_session_pool(strategy: str, window_embs: np.ndarray) -> np.ndarray:
             window_embs.std(axis=0),
             np.percentile(window_embs, 25, axis=0),
             np.percentile(window_embs, 75, axis=0),
+        ])
+
+    if strategy == 'mean_std_max':
+        return np.concatenate([
+            window_embs.mean(axis=0),
+            window_embs.std(axis=0),
+            window_embs.max(axis=0),
         ])
 
     raise ValueError(f'Unknown session_pool: {strategy!r}')
@@ -430,8 +474,8 @@ def embed_all(
     feature_cols = build_feature_cols(ckpt['args'].get('kinematics', 'P'))
     dataset      = data_dir.name
 
-    window_embed_dim  = embed_dim * (3 if window_pool == 'mean_std_max' else 1)
-    session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 1)
+    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 1)
+    session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 3 if session_pool == 'mean_std_max' else 1)
 
     emb_dir      = out_dir / run_stem(ckpt['args'], stride, dataset, window_pool, session_pool)
     per_file_dir = emb_dir / 'per_file'
@@ -468,6 +512,115 @@ def embed_all(
         if (i + 1) % 50 == 0 or (i + 1) == len(parquet_files):
             print(f'    [{i+1:4d}/{len(parquet_files)}] {fpath.name} '
                   f'→ {len(windows)} windows, shape {embs.shape}')
+
+    if not seq_embeddings:
+        raise RuntimeError(
+            f'No files to embed in {data_dir}. '
+            f'Found {len(all_parquet)} parquet file(s) total'
+            + (f', but none matched the requested split keys.' if include_files is not None else '.')
+        )
+    seq_arr = np.stack(seq_embeddings, axis=0).astype(np.float32)
+    np.save(emb_dir / 'sequence_embeddings.npy', seq_arr)
+
+    col_names = [f'e{i}' for i in range(session_embed_dim)]
+    df_out    = pd.DataFrame(seq_arr, columns=col_names)
+    df_out.insert(0, 'filename', seq_names)
+    df_out.to_csv(emb_dir / 'sequence_embeddings.csv', index=False)
+
+    print(f'  Sequences   : {seq_arr.shape}')
+    print(f'OUT_DIR: {emb_dir}')
+    return emb_dir
+
+
+# ---------------------------------------------------------------------------
+# Pre-loading helpers (for callers that embed many checkpoints on fixed data)
+# ---------------------------------------------------------------------------
+
+def load_raw_sequences(
+    data_dir:      Path,
+    feature_cols:  list[str],
+    include_files: set[Path] | None = None,
+) -> list[tuple[str, np.ndarray]]:
+    """Return [(stem, raw_float32_array), ...] from parquet files in data_dir.
+
+    Loads raw (un-normalized) arrays so a caller can reuse them across multiple
+    checkpoint evaluations without re-reading from disk each time.
+    """
+    all_parquet = sorted(data_dir.glob('*.parquet'))
+    files = [f for f in all_parquet if include_files is None or f in include_files]
+    result = []
+    for fpath in files:
+        df = pd.read_parquet(fpath, columns=feature_cols)
+        result.append((fpath.stem, np.nan_to_num(df.values.astype(np.float32), nan=0.0)))
+    print(f'  Loaded {len(result)}/{len(all_parquet)} sequences from {data_dir.name}')
+    return result
+
+
+def embed_all_preloaded(
+    raw_sequences: list[tuple[str, np.ndarray]],
+    dataset_name:  str,
+    ckpt_path:     Path,
+    out_dir:       Path,
+    stride:        int,
+    batch_size:    int,
+    window_pool:   str,
+    session_pool:  str,
+    layer_avg_n:   int = 4,
+    model:         nn.Module | None = None,
+    ckpt:          dict | None = None,
+) -> Path:
+    """Like embed_all but accepts pre-loaded raw (un-normalized) arrays.
+
+    Skips all parquet I/O, enabling data reuse across multiple checkpoint
+    evaluations for the same dataset.  The device is inferred from the
+    passed model when provided, or defaults to cuda/cpu if loading fresh.
+    """
+    if model is None or ckpt is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model, ckpt = load_checkpoint(ckpt_path, device)
+    else:
+        device = next(model.parameters()).device
+
+    max_len      = ckpt['args']['max_len']
+    embed_dim    = ckpt['args']['embed_dim']
+    norm_mean    = ckpt['norm_mean'].astype(np.float32)
+    norm_std     = ckpt['norm_std'].astype(np.float32)
+
+    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 1)
+    session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 3 if session_pool == 'mean_std_max' else 1)
+
+    emb_dir      = out_dir / run_stem(ckpt['args'], stride, dataset_name, window_pool, session_pool)
+    per_file_dir = emb_dir / 'per_file'
+    per_file_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f'  Pool        : window={window_pool}  session={session_pool}')
+    print(f'  Output dir  : {emb_dir}')
+    print(f'  Window emb  : {window_embed_dim}d   Session emb: {session_embed_dim}d')
+
+    seq_names: list[str]      = []
+    seq_embeddings: list      = []
+
+    for i, (stem, x_raw) in enumerate(raw_sequences):
+        x = (x_raw - norm_mean) / (norm_std + 1e-8)
+        x = np.clip(x, -10.0, 10.0)
+
+        windows, lengths = sequence_to_windows(x, max_len=max_len, stride=stride)
+        embs = embed_windows(
+            model, windows, lengths,
+            max_len=max_len, batch_size=batch_size, device=device,
+            window_pool=window_pool, layer_avg_n=layer_avg_n,
+        )
+
+        np.save(per_file_dir / f'{stem}.npy', embs)
+        seq_embeddings.append(_apply_session_pool(session_pool, embs))
+        seq_names.append(stem)
+
+        if (i + 1) % 50 == 0 or (i + 1) == len(raw_sequences):
+            print(f'    [{i+1:4d}/{len(raw_sequences)}] {stem} '
+                  f'→ {len(windows)} windows, shape {embs.shape}')
+
+    if not seq_embeddings:
+        raise RuntimeError(f'No sequences to embed in {dataset_name!r}.')
 
     seq_arr = np.stack(seq_embeddings, axis=0).astype(np.float32)
     np.save(emb_dir / 'sequence_embeddings.npy', seq_arr)
@@ -562,6 +715,15 @@ def embed_and_probe(args) -> list[Path]:
     sp = getattr(args, 'session_pool', None)
     pool_configs = [(wp, sp)] if (wp and sp) else POOL_CONFIGS
 
+    # Parse --identity_peers into [(path, label), ...] once, before the pool loop.
+    identity_peers: list[tuple[str, str]] = []
+    identity_peers_raw = getattr(args, 'identity_peers', None)
+    if identity_peers_raw:
+        for item in identity_peers_raw.split(','):
+            item = item.strip()
+            path, sep, label = item.partition(':')
+            identity_peers.append((path.strip(), label.strip() if sep else Path(path.strip()).name))
+
     out_dirs: list[Path] = []
     for window_pool, session_pool in pool_configs:
         print(f'\n{"─"*60}')
@@ -595,6 +757,21 @@ def embed_and_probe(args) -> list[Path]:
             if result.returncode != 0:
                 print(f'  [Probe ERROR]\n{result.stderr}', file=sys.stderr)
 
+        if identity_peers:
+            pool_suffix = f'_wp{window_pool}_sp{session_pool}'
+            matching = [(p, l) for p, l in identity_peers if Path(p).name.endswith(pool_suffix)]
+            if matching:
+                print(f'\n  [Identity Probe] pool={window_pool}/{session_pool}  '
+                      f'peers={[l for _, l in matching]}')
+                id_dirs = [f'{emb_dir}:{data_dir.name}'] + [f'{p}:{l}' for p, l in matching]
+                cmd = [sys.executable, str(probe_script), '--identity-dirs'] + id_dirs
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                print(result.stdout)
+                if result.returncode != 0:
+                    print(f'  [Identity Probe ERROR]\n{result.stderr}', file=sys.stderr)
+            else:
+                print(f'  [Identity Probe] No peers found matching pool suffix {pool_suffix!r} — skipped')
+
     print(f'\n{"="*60}')
     print(f'All output dirs for {data_dir.name}:')
     for d in out_dirs:
@@ -627,10 +804,10 @@ def parse_args():
                    help='Columns to probe (space-separated). '
                         'Defaults to the standard columns for the objective.')
     p.add_argument('--window_pool', default=None,
-                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last'],
+                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'],
                    help='Run only this window pooling strategy instead of all four configs.')
     p.add_argument('--session_pool', default=None,
-                   choices=['mean', 'stat4'],
+                   choices=['mean', 'stat4', 'mean_std_max'],
                    help='Run only this session pooling strategy instead of all four configs.')
     p.add_argument('--split_keys', default=None,
                    help="Comma-separated split subsets to embed: 'train,val', 'train,val,test', "
@@ -641,6 +818,11 @@ def parse_args():
     p.add_argument('--eval_split', default=None,
                    choices=['val', 'test'],
                    help='Evaluate probe on this split subset (passed through to train_linear_probe).')
+    p.add_argument('--identity_peers', default=None,
+                   help="Comma-separated 'emb_dir:Label' pairs of pre-embedded peer datasets. "
+                        "After each pool config, runs a dataset identity probe combining the "
+                        "current output with any peer whose dir name ends with the same pool suffix. "
+                        "Example: /path/to/DEVCOM_emb:DEVCOM,/path/to/other_FAB_emb:FAB2")
     return p.parse_args()
 
 

@@ -62,6 +62,17 @@ def npy_feature_indices(feature_cols: list[str]) -> np.ndarray:
 # Dataset
 # ---------------------------------------------------------------------------
 
+def _available_ram_bytes() -> int:
+    try:
+        with open('/proc/meminfo') as _f:
+            for _line in _f:
+                if _line.startswith('MemAvailable:'):
+                    return int(_line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
 class VRDataset(Dataset):
     """
     Loads ego-centric VR motion sequences for MAE pre-training.
@@ -109,28 +120,53 @@ class VRDataset(Dataset):
             self.files   = all_npy
             self.use_npy = True
             self._npy_col_idx = npy_feature_indices(feature_cols)
-            # Precompute (data_byte_offset, n_rows, n_cols) for every file so
-            # __getitem__ can seek directly to the crop without opening a mmap.
-            print(f'Reading npy headers for {len(self.files):,} files …', flush=True)
-            self._headers = [self._npy_header(f) for f in self.files]
-            self._file_n_rows = [hdr[1] for hdr in self._headers]
+
+            _packed_path = npy_path.parent / f'{npy_path.name}_packed.npy'
+            _index_path  = npy_path.parent / f'{npy_path.name}_index.npz'
+            _use_packed  = False
+            if _packed_path.exists() and _index_path.exists():
+                _packed_size = _packed_path.stat().st_size
+                _avail_ram   = _available_ram_bytes()
+                if _avail_ram > _packed_size:
+                    _use_packed = True
+                    print(f'  Using packed mmap: {_packed_path.name}'
+                          f'  ({_packed_size/1e9:.1f} GB fits in {_avail_ram/1e9:.1f} GB available RAM)', flush=True)
+                else:
+                    print(f'  Packed file ({_packed_size/1e9:.1f} GB) exceeds available RAM'
+                          f' ({_avail_ram/1e9:.1f} GB) — using per-file reads', flush=True)
+            if _use_packed:
+                _idx          = np.load(_index_path)
+                _name_to_pos  = {n: i for i, n in enumerate(_idx['names'].tolist())}
+                self._packed      = np.load(str(_packed_path), mmap_mode='r')
+                self._packed_off  = np.array([_idx['offsets'][_name_to_pos[f.name]] for f in self.files], dtype=np.int64)
+                self._file_n_rows = [int(_idx['n_rows'][_name_to_pos[f.name]]) for f in self.files]
+                self._headers     = None
+            else:
+                self._packed     = None
+                self._packed_off = None
+                print(f'Reading npy headers for {len(self.files):,} files …', flush=True)
+                self._headers     = [self._npy_header(f) for f in self.files]
+                self._file_n_rows = [hdr[1] for hdr in self._headers]
         else:
             import pyarrow.parquet as pq
             all_files = sorted(Path(data_dir).glob('*.parquet'))
-            # Read metadata once; keep row counts for the sampler.
             file_rows = [(f, pq.read_metadata(f).num_rows) for f in all_files]
             self.files        = [f for f, n in file_rows if n >= 2]
             self._file_n_rows = [n for _, n in file_rows if n >= 2]
             self.use_npy = False
             self._npy_col_idx = None
+            self._packed     = None
+            self._packed_off = None
 
         if exclude_datasets:
             _excl = set(exclude_datasets)
             keep = [i for i, f in enumerate(self.files) if f.stem.split('_')[0] not in _excl]
-            self.files = [self.files[i] for i in keep]
-            if self.use_npy:
-                self._headers = [self._headers[i] for i in keep]
+            self.files        = [self.files[i] for i in keep]
             self._file_n_rows = [self._file_n_rows[i] for i in keep]
+            if self.use_npy and self._headers is not None:
+                self._headers = [self._headers[i] for i in keep]
+            if self._packed_off is not None:
+                self._packed_off = self._packed_off[keep]
             print(f'Excluded datasets: {sorted(_excl)}  ({len(self.files):,} files remain)', flush=True)
 
         self.feature_cols   = feature_cols
@@ -224,38 +260,48 @@ class VRDataset(Dataset):
         file_idx = random.choices(self._ds_groups[ds], cum_weights=self._ds_file_cum[ds], k=1)[0]
 
         if self.use_npy:
-            offset, n_rows, n_cols, fortran_order = self._headers[file_idx]
-            if fortran_order:
-                # Column-major file: mmap slice then immediately close the handle.
-                # Opening per sample (vs. permanently caching) prevents ENOMEM.
-                mmap = np.load(self.files[file_idx], mmap_mode='r')
+            if self._packed is not None:
+                n_rows = self._file_n_rows[file_idx]
+                base   = int(self._packed_off[file_idx])
+                n_cols = self._packed.shape[1]
                 if n_rows >= self.max_len:
                     start  = random.randint(0, n_rows - self.max_len)
-                    x      = np.array(mmap[start:start + self.max_len], dtype=np.float32)
+                    x      = np.array(self._packed[base + start : base + start + self.max_len], dtype=np.float32)
                     length = self.max_len
                 else:
-                    x      = np.array(mmap, dtype=np.float32)
+                    x      = np.array(self._packed[base : base + n_rows], dtype=np.float32)
                     length = n_rows
-                    pad    = np.zeros((self.max_len - n_rows, n_cols), dtype=np.float32)
-                    x      = np.concatenate([x, pad], axis=0)
-                del mmap
+                    x      = np.concatenate([x, np.zeros((self.max_len - n_rows, n_cols), np.float32)])
             else:
-                # C-order file: direct byte seek — fast, no file-handle state.
-                if n_rows >= self.max_len:
-                    start    = random.randint(0, n_rows - self.max_len)
-                    byte_off = offset + start * n_cols * 4
+                offset, n_rows, n_cols, fortran_order = self._headers[file_idx]
+                if fortran_order:
+                    mmap = np.load(self.files[file_idx], mmap_mode='r')
+                    if n_rows >= self.max_len:
+                        start  = random.randint(0, n_rows - self.max_len)
+                        x      = np.array(mmap[start:start + self.max_len], dtype=np.float32)
+                        length = self.max_len
+                    else:
+                        x      = np.array(mmap, dtype=np.float32)
+                        length = n_rows
+                        pad    = np.zeros((self.max_len - n_rows, n_cols), dtype=np.float32)
+                        x      = np.concatenate([x, pad], axis=0)
+                    del mmap
                 else:
-                    byte_off = offset
-                with open(self.files[file_idx], 'rb') as f:
-                    f.seek(byte_off)
-                    count = min(n_rows, self.max_len) * n_cols
-                    x = np.fromfile(f, dtype=np.float32, count=count).reshape(-1, n_cols)
-                if n_rows >= self.max_len:
-                    length = self.max_len
-                else:
-                    length = n_rows
-                    pad = np.zeros((self.max_len - n_rows, n_cols), dtype=np.float32)
-                    x   = np.concatenate([x, pad], axis=0)
+                    if n_rows >= self.max_len:
+                        start    = random.randint(0, n_rows - self.max_len)
+                        byte_off = offset + start * n_cols * 4
+                    else:
+                        byte_off = offset
+                    with open(self.files[file_idx], 'rb') as f:
+                        f.seek(byte_off)
+                        count = min(n_rows, self.max_len) * n_cols
+                        x = np.fromfile(f, dtype=np.float32, count=count).reshape(-1, n_cols)
+                    if n_rows >= self.max_len:
+                        length = self.max_len
+                    else:
+                        length = n_rows
+                        pad = np.zeros((self.max_len - n_rows, n_cols), dtype=np.float32)
+                        x   = np.concatenate([x, pad], axis=0)
             x = x[:, self._npy_col_idx]
         else:
             df  = pd.read_parquet(self.files[file_idx], columns=self.feature_cols)

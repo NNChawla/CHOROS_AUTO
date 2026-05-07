@@ -612,6 +612,96 @@ def run_probe(
     return results
 
 
+def run_identity_probe(emb_dirs_labels: list[tuple[str, str]]) -> dict:
+    """
+    Diagnostic: predict which dataset each session came from.
+
+    Uses stratified k-fold throughout (C selection + prediction) so it
+    scales to combined datasets without the cost of leave-one-out.
+
+    Parameters
+    ----------
+    emb_dirs_labels : list of (emb_dir_path, label) pairs.
+                      Each dir must contain sequence_embeddings.csv.
+
+    Returns
+    -------
+    dict with bacc, mcc, f1, auc keys.
+    """
+    frames = []
+    for emb_dir, label in emb_dirs_labels:
+        csv_path = Path(emb_dir) / 'sequence_embeddings.csv'
+        df = pd.read_csv(csv_path)
+        df['_dataset'] = label
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+    feat_cols = [c for c in combined.columns if c.startswith('e') and c[1:].isdigit()]
+
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    y = le.fit_transform(combined['_dataset'].values)
+    n_classes = len(le.classes_)
+
+    print(f"\n{'='*72}")
+    print(f"Dataset Identity Probe  ({n_classes} classes, {len(combined)} samples)")
+    print(f"{'='*72}")
+    for i, cls in enumerate(le.classes_):
+        print(f"  Class {i} '{cls}': n={int(np.sum(y == i))}")
+
+    X = StandardScaler().fit_transform(combined[feat_cols].values.astype(np.float32))
+
+    n_splits = min(5, int(min(np.bincount(y))))
+    n_splits = max(2, n_splits)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        clf = LogisticRegressionCV(
+            Cs=20, cv=skf, max_iter=2000,
+            scoring="balanced_accuracy",
+            class_weight="balanced",
+            solver="lbfgs",
+            n_jobs=-1,
+            random_state=42,
+        )
+        clf.fit(X, y)
+        best_C = clf.C_[0]
+
+        skf_pred = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
+        model = LogisticRegression(
+            C=best_C, max_iter=2000,
+            class_weight="balanced",
+            solver="lbfgs",
+            random_state=42,
+        )
+        y_prob = cross_val_predict(model, X, y, cv=skf_pred,
+                                   method="predict_proba", n_jobs=-1)
+
+    y_pred = y_prob.argmax(axis=1)   # integer-encoded, matches y
+
+    bacc = balanced_accuracy_score(y, y_pred)
+    mcc  = matthews_corrcoef(y, y_pred)
+    f1   = f1_score(y, y_pred, average='macro', zero_division=0)
+    try:
+        auc = roc_auc_score(y, y_prob, multi_class="ovr", average="macro") if n_classes > 2 \
+              else roc_auc_score(y, y_prob[:, 1])
+    except ValueError:
+        auc = float('nan')
+
+    auc_str = f"  ROC-AUC {'(macro) ' if n_classes > 2 else ''}       : {auc:.4f}"
+    print(f"\n── Dataset Identity ({n_splits}-fold CV) ────────────────────────────────────────")
+    print(f"  Best C          : {best_C:.4f}")
+    print(f"  Balanced Acc.   : {bacc:.4f}")
+    print(f"  MCC             : {mcc:.4f}")
+    print(f"  F1 (macro)      : {f1:.4f}")
+    print(auc_str)
+    print(f"\n  Classification report ({n_splits}-fold CV):")
+    print(classification_report(y, y_pred, target_names=le.classes_, digits=3))
+
+    return {'bacc': bacc, 'mcc': mcc, 'f1': f1, 'auc': auc}
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument("--emb-dir",   type=str, default=None,
@@ -630,6 +720,20 @@ if __name__ == '__main__':
     p.add_argument("--eval_split", type=str, default=None,
                    choices=["val", "test"],
                    help="Evaluate probe on this split subset (required with --train_split).")
+    p.add_argument("--identity-dirs", nargs='+', default=None,
+                   help="Run dataset identity probe. Provide 2+ 'path:Label' arguments, "
+                        "e.g. /path/to/emb1:FAB /path/to/emb2:DEVCOM. "
+                        "Bypasses --objective / --emb-dir.")
     args = p.parse_args()
-    run_probe(args.emb_dir, args.objective, args.target_col,
-              train_split=args.train_split, eval_split=args.eval_split)
+
+    if args.identity_dirs:
+        pairs = []
+        for item in args.identity_dirs:
+            path, sep, label = item.partition(':')
+            pairs.append((path.strip(), label.strip() if sep else Path(path.strip()).name))
+        if len(pairs) < 2:
+            p.error("--identity-dirs requires at least 2 entries")
+        run_identity_probe(pairs)
+    else:
+        run_probe(args.emb_dir, args.objective, args.target_col,
+                  train_split=args.train_split, eval_split=args.eval_split)
