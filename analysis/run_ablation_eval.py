@@ -42,7 +42,7 @@ from splits import filter_devcom_files, filter_fab_files
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_6_26_ablations")
+BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_7_26_ablations")
 EMBED_OUT = REPO / 'outputs' / 'embeddings'
 JSON_OUT  = BASE / "ablation_eval_results.json"
 TXT_OUT   = BASE / "ablation_eval_summary.txt"
@@ -58,19 +58,39 @@ GPU_IDS = [0, 0, 0, 0, 1, 1]
 _N_CPU        = os.cpu_count() or 4
 _PROBE_N_JOBS = max(1, _N_CPU // len(GPU_IDS))
 
-# (friendly_name, directory_basename)
-RUNS = [
-    ("spe256k_dp0.05_sf2",        "30601_20260507_002403_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.5_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe256k_tr0.25_sf2",        "30602_20260507_035529_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe256k_dp0.05_sf4",        "30901_20260507_002414_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.5_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe256k_dp0.05_tr0.25_sf4", "30903_20260507_034326_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_dp0.05_sf4",        "40901_20260506_203027_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.5_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_tr0.25_sf4",        "40902_20260506_215133_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_dp0.05_tr0.25_sf4", "40903_20260506_233147_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_dp0.05_sf2",        "50901_20260507_020828_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.5_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_tr0.25_sf2",        "50902_20260507_030820_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-    ("spe512k_dp0.05_tr0.25_sf2", "50903_20260507_040849_VR_npy_PVAJ_posejepa_e150_bs512_lr0.0004_dim256_l6_ml128_ps8_tr0.25_tmmasked_span_llsmooth_l1_poolmean_wu12_minlr1e-06_kinPVAJ_sa0.5"),
-]
+def _discover_runs(base: Path) -> list[tuple[str, str]]:
+    """Discover run directories under base and assign names from GPU type and index.
+
+    Directory naming convention: {YYYYMMDD_HHMMSS}_{GPU}_...
+    e.g. 20260507_043536_4090_... → friendly name "4090_1" (first 4090 by time)
+
+    Per-GPU indices are assigned in timestamp order (1-based).
+    Returns (friendly_name, dir_basename) pairs sorted by start timestamp.
+    """
+    from collections import defaultdict
+    from datetime import datetime
+    pat = re.compile(r'^(\d{8}_\d{6})_(\d{3,4})_')
+    entries = []
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+        m = pat.match(d.name)
+        if not m:
+            continue
+        ts  = datetime.strptime(m.group(1), '%Y%m%d_%H%M%S')
+        gpu = m.group(2)
+        entries.append((ts, gpu, d.name))
+    entries.sort(key=lambda x: x[0])
+    gpu_counts: dict[str, int] = defaultdict(int)
+    result = []
+    for _, gpu, dirname in entries:
+        gpu_counts[gpu] += 1
+        result.append((f"{gpu}_{gpu_counts[gpu]}", dirname))
+    return result
+
+
+# (friendly_name, directory_basename) — auto-discovered, ordered by start time
+RUNS = _discover_runs(BASE)
 
 def get_checkpoints(dir_path: Path) -> list[str]:
     return sorted(p.stem for p in dir_path.glob("checkpoint_*.pt"))
@@ -281,6 +301,8 @@ CKPT_SHORT_ORDER = [
 ]
 
 def format_per_run(results: dict) -> str:
+    if not RUNS:
+        return "(no runs discovered)"
     lines = []
     for run_name, _ in RUNS:
         run_data = results.get(run_name, {})
@@ -308,6 +330,8 @@ def format_per_run(results: dict) -> str:
     return "\n".join(lines)
 
 def format_cross_run(results: dict, metric: str = 'mcc') -> str:
+    if not RUNS:
+        return f"\nCross-run comparison  metric={metric.upper()}\n  (no runs discovered)"
     col_keys = [(s, cmd_id) for s in CKPT_SHORT_ORDER for cmd_id, _ in CMD_ORDER]
     def abbrev(s):
         return s.replace("checkpoint_best_probe_", "probe_").replace("checkpoint_", "")
