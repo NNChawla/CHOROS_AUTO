@@ -156,7 +156,6 @@ class VRDataset(Dataset):
         self.max_len        = max_len
         self.feat_mean      = feat_mean
         self.feat_std       = feat_std
-        self._n             = samples_per_epoch if samples_per_epoch > 0 else len(self.files)
         self.sampling_alpha = sampling_alpha
 
         groups: dict[str, list[int]] = {}
@@ -191,6 +190,7 @@ class VRDataset(Dataset):
         self._ds_total_wins = ds_total_wins
 
         total_wins = sum(ds_total_wins.values())
+        self._n = samples_per_epoch if samples_per_epoch > 0 else total_wins
         if verbose:
             print(f'\nDataset temperature sampling  alpha={sampling_alpha:.2f}  '
                   f'({len(ds_names)} datasets  {total_wins:,} total windows)', flush=True)
