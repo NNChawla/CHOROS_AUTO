@@ -3,13 +3,14 @@
 # then build + install flash-attention from source (FA3-capable build).
 #
 # Usage:
-#   bash setup_env.sh                        # create env, build flash-attn from source
+#   bash setup_env.sh                        # create env, pip install flash-attn from PyPI
 #   bash setup_env.sh --check                # run environment checks only, no changes
 #   bash setup_env.sh --coordinator          # also set up PostgreSQL Optuna DB server
+#   bash setup_env.sh --build-flash-attn     # build flash-attn from source instead of PyPI
 #   bash setup_env.sh --export-wheel DIR     # build flash-attn, save .whl to DIR, then install
 #   ENV_NAME=MY_ENV bash setup_env.sh
 #
-# To skip the source build and install a pre-built wheel:
+# To install a pre-built wheel instead of pulling from PyPI:
 #   FLASH_ATTN_WHEEL=/path/to/flash_attn-*.whl bash setup_env.sh
 #   FLASH_ATTN_WHEEL=https://host/flash_attn-*.whl bash setup_env.sh
 #
@@ -43,8 +44,10 @@ _RAM_JOBS=$(( _RAM_GB / 25 ))
 MAX_JOBS=$(( _HALF_CORES < _RAM_JOBS ? _HALF_CORES : _RAM_JOBS ))
 MAX_JOBS=$(( MAX_JOBS < 1 ? 1 : MAX_JOBS ))
 
-# Pre-built wheel: set to a local path or URL to skip the source build.
+# Pre-built wheel: set to a local path or URL to skip the PyPI/source install.
 FLASH_ATTN_WHEEL="${FLASH_ATTN_WHEEL:-}"
+# Set to 1 (or pass --build-flash-attn) to compile flash-attn from source.
+FLASH_ATTN_BUILD_SOURCE="${FLASH_ATTN_BUILD_SOURCE:-0}"
 # Directory to save the built wheel into (--export-wheel DIR).
 FLASH_ATTN_WHEEL_OUT=""
 
@@ -52,10 +55,11 @@ CHECK_ONLY=0
 COORDINATOR=0
 while [[ $# -gt 0 ]]; do
     case "${1}" in
-        --check)        CHECK_ONLY=1 ;;
-        --coordinator)  COORDINATOR=1 ;;
-        --export-wheel) shift; FLASH_ATTN_WHEEL_OUT="${1:?'--export-wheel requires a directory'}" ;;
-        *)              die "Unknown argument: ${1}" ;;
+        --check)             CHECK_ONLY=1 ;;
+        --coordinator)       COORDINATOR=1 ;;
+        --build-flash-attn)  FLASH_ATTN_BUILD_SOURCE=1 ;;
+        --export-wheel)      shift; FLASH_ATTN_WHEEL_OUT="${1:?'--export-wheel requires a directory'}" ;;
+        *)                   die "Unknown argument: ${1}" ;;
     esac
     shift
 done
@@ -516,7 +520,17 @@ build_flash_attn() {
         return
     fi
 
-    # --- Clone / update source ---
+    # --- PyPI install (default when no wheel and no source-build flag) ---
+    if [[ -z "${FLASH_ATTN_WHEEL_OUT}" && "${FLASH_ATTN_BUILD_SOURCE}" != "1" ]]; then
+        info "Installing flash-attn from PyPI ..."
+        conda run -n "${ENV_NAME}" pip install flash-attn --no-build-isolation
+        FA_VER=$(conda run -n "${ENV_NAME}" python -c \
+            "import flash_attn; print(flash_attn.__version__)" 2>/dev/null || echo "unknown")
+        info "flash-attn installed: version ${FA_VER}"
+        return
+    fi
+
+    # --- Build from source (--build-flash-attn / FLASH_ATTN_BUILD_SOURCE=1 / --export-wheel) ---
     info "Cloning flash-attention from ${FLASH_ATTN_REPO} ..."
     if [[ -d "${FLASH_ATTN_DIR}/.git" ]]; then
         warn "Source dir ${FLASH_ATTN_DIR} exists — pulling latest"
