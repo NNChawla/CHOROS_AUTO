@@ -42,7 +42,7 @@ from splits import filter_devcom_files, filter_fab_files
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_7_26_ablations")
+BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_8_26_24_epochs")
 EMBED_OUT = REPO / 'outputs' / 'embeddings'
 JSON_OUT  = BASE / "ablation_eval_results.json"
 TXT_OUT   = BASE / "ablation_eval_summary.txt"

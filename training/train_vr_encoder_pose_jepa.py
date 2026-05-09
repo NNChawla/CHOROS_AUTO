@@ -585,20 +585,26 @@ _PROBE_TARGET_SHORT = {
 }
 
 
-def _parse_probe_results(text: str) -> tuple[float | None, dict[str, float]]:
+def _active_metrics(args) -> frozenset:
+    """Return the set of probe metrics to run, respecting --eval_metrics."""
+    m = getattr(args, 'eval_metrics', None)
+    return frozenset(m) if m else _PROBE_TARGET_KEYS
+
+
+def _parse_probe_results(text: str, target_keys: frozenset) -> tuple[float | None, dict[str, float]]:
     """Return (mean_val_mcc, per_target_mccs).
 
-    mean_val_mcc is None if any target is missing; per_target_mccs contains
-    whatever targets were found.
+    mean_val_mcc is None if any requested target is missing; per_target_mccs
+    contains whatever targets were found.
     """
     mccs: dict[str, float] = {}
     for line in text.splitlines():
         m = _PROBE_SUMMARY_RE.search(line)
         if m and m.group(3) == 'val':
             target = m.group(2)
-            if target in _PROBE_TARGET_KEYS:
+            if target in target_keys:
                 mccs[target] = float(m.group(5))
-    avg = sum(mccs.values()) / len(mccs) if _PROBE_TARGET_KEYS <= mccs.keys() else None
+    avg = sum(mccs.values()) / len(mccs) if target_keys <= mccs.keys() else None
     return avg, mccs
 
 
@@ -635,12 +641,17 @@ def _periodic_eval(
 
     embed_script = Path(__file__).parent.parent / 'pipeline' / 'embed_target_data.py'
 
+    eval_metrics = _active_metrics(args)
+
     eval_targets = []
     if args.fab_eval_dir and Path(args.fab_eval_dir).exists():
-        eval_targets.append((args.fab_eval_dir, 'FAB', ['portScore']))
+        cols = [c for c in ['portScore'] if c in eval_metrics]
+        if cols:
+            eval_targets.append((args.fab_eval_dir, 'FAB', cols))
     if args.devcom_eval_dir and Path(args.devcom_eval_dir).exists():
-        eval_targets.append((args.devcom_eval_dir, 'D3',
-                             ['bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']))
+        cols = [c for c in ['bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3'] if c in eval_metrics]
+        if cols:
+            eval_targets.append((args.devcom_eval_dir, 'D3', cols))
     if not eval_targets:
         print(f'[Eval] no valid eval dirs — skipping epoch {epoch} eval')
         return None, {}
@@ -683,7 +694,7 @@ def _periodic_eval(
     print(f'{"="*72}\n')
     sys.stdout.flush()
 
-    return _parse_probe_results('\n'.join(all_stdout))
+    return _parse_probe_results('\n'.join(all_stdout), eval_metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +892,7 @@ def train(args):
     # --------------------------------------------------------------- resume
     best_jepa_loss       = float('inf')
     best_probe_mcc       = float('-inf')
-    best_probe_metric_mccs: dict[str, float] = {k: float('-inf') for k in _PROBE_TARGET_KEYS}
+    best_probe_metric_mccs: dict[str, float] = {k: float('-inf') for k in _active_metrics(args)}
     global_step          = 0
     start_epoch          = 1
     if args.resume:
@@ -894,7 +905,7 @@ def train(args):
         best_jepa_loss         = ckpt_r.get('best_loss', float('inf'))
         best_probe_mcc         = ckpt_r.get('best_probe_mcc', float('-inf'))
         best_probe_metric_mccs = ckpt_r.get(
-            'best_probe_metric_mccs', {k: float('-inf') for k in _PROBE_TARGET_KEYS}
+            'best_probe_metric_mccs', {k: float('-inf') for k in _active_metrics(args)}
         )
         global_step    = ckpt_r.get('global_step', 0)
         start_epoch    = ckpt_r['epoch'] + 1
@@ -1176,6 +1187,11 @@ def parse_args():
     p.add_argument('--eval_split_mode',   type=str, default=None,
                    choices=['val', 'test'])
     p.add_argument('--eval_use_best_ckpt', action='store_true', default=False)
+    p.add_argument('--eval_metrics', nargs='+', default=None, metavar='METRIC',
+                   choices=['portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3'],
+                   help='subset of probe metrics to embed and evaluate '
+                        '(default: all three). '
+                        'Choices: portScore bot_dist_mean_s3 firing_accuracy_AOBJ_s3')
 
     args = p.parse_args()
     args._gpu_profile = _profile

@@ -135,14 +135,15 @@ def sample_hyperparams_tsjepa(trial: optuna.Trial) -> dict:
 
 
 def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
-    embed_dim   = trial.suggest_categorical('embed_dim', [192])
-    n_heads     = trial.suggest_categorical('n_heads', _N_HEADS_CHOICES)
+    embed_dim   = trial.suggest_categorical('embed_dim', [64])
+    # n_heads     = trial.suggest_categorical('n_heads', _N_HEADS_CHOICES)
+    n_heads     = trial.suggest_categorical('n_heads', [2])
     target_mode = trial.suggest_categorical('target_mode', ['masked_span'])
 
     # ffn_dim and pred_ffn_dim expressed as multiples of embed_dim so Optuna
     # reasons about them in a scale-invariant way.
-    ffn_mult      = trial.suggest_categorical('ffn_mult', [2, 4])
-    pred_ffn_mult = trial.suggest_categorical('pred_ffn_mult', [2, 4])
+    ffn_mult      = trial.suggest_categorical('ffn_mult', [2])
+    pred_ffn_mult = trial.suggest_categorical('pred_ffn_mult', [1])
 
     # future_min_gap and future_horizon only matter when future paths are possible.
     uses_future = target_mode in ('future', 'mixed')
@@ -156,27 +157,32 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
     )
 
     return {
-        'patch_size':       trial.suggest_categorical('patch_size', [8, 16, 32]),
-        'target_ratio':     trial.suggest_float('target_ratio', 0.35, 0.65),
+        'patch_size':       trial.suggest_categorical('patch_size', [8]),
+        'target_ratio':     trial.suggest_float('target_ratio', 0.1, 0.5, step=0.05),
+        # 'target_ratio':     trial.suggest_categorical('target_ratio', [0.25]),
         'target_mode':      target_mode,
-        'n_target_blocks':  trial.suggest_int('n_target_blocks', 1, 4) if target_mode != 'future' else 2,
+        # 'n_target_blocks':  trial.suggest_int('n_target_blocks', 1, 4) if target_mode != 'future' else 2,
+        'n_target_blocks':  trial.suggest_categorical('n_target_blocks', [2]),
         'future_min_gap':   future_min_gap,
         'future_horizon':   future_horizon,
         'ema_start':        trial.suggest_categorical('ema_start', [0.996, 0.997, 0.998, 0.999]),
-        'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
+        # 'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
+        'pred_layers':      trial.suggest_categorical('pred_layers', [1]),
         'pred_ffn_mult':    pred_ffn_mult,
         'pred_ffn_dim':     embed_dim * pred_ffn_mult,
         'latent_loss':      trial.suggest_categorical('latent_loss', ['smooth_l1']),
-        'lr':               trial.suggest_float('lr', 2e-5, 2e-3, log=True),
-        'sampling_alpha':   trial.suggest_float('sampling_alpha', 0.4, 0.6),
+        'lr':               trial.suggest_float('lr', 5e-5, 5e-3, log=True),
+        # 'sampling_alpha':   trial.suggest_float('sampling_alpha', 0.4, 0.6),
+        'sampling_alpha':   trial.suggest_categorical('sampling_alpha', [0.5]),
         'dropout':          0.05,
         'embed_dim':        embed_dim,
         'n_heads':          n_heads,
-        'n_layers':         trial.suggest_int('n_layers', 4, 8),
+        # 'n_layers':         trial.suggest_int('n_layers', 4, 8),
+        'n_layers':         trial.suggest_categorical('n_layers', [2]),
         'ffn_mult':         ffn_mult,
         'ffn_dim':          embed_dim * ffn_mult,
         # max_len in {128} — divisible by patch_size in {8, 16}
-        'max_len':          trial.suggest_categorical('max_len', [64, 128, 192, 256]),
+        'max_len':          trial.suggest_categorical('max_len', [32, 64, 128, 192, 256]),
     }
 
 
@@ -316,21 +322,24 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '25',
+        '--epochs',             '100',
         '--embed_eval_interval','5',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
-        '--warmup_epochs',      str(_warmup_epochs_posejepa(25)),
-        '--val_fraction',       '0.1',
+        '--warmup_epochs',      str(_warmup_epochs_posejepa(100)),
+        '--val_fraction',       '0.15',
         '--min_lr',             '1e-6',
         '--kinematics',         'PVAJ',
-        '--samples_per_epoch',  '262144',
+        '--samples_per_epoch',  '0',
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
-        '--eval_window_pool',   'mean',
+        '--eval_window_pool',   'stat9',
         '--eval_session_pool',  'mean',
         '--eval_split_mode',    'val',
+        # '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
+        '--eval_metrics',       'portScore', 'bot_dist_mean_s3',
+        '--stride_factor',      '2',
         '--patch_size',         str(params['patch_size']),
         '--target_ratio',       str(params['target_ratio']),
         '--target_mode',        params['target_mode'],
@@ -851,26 +860,30 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
     pred_ffn_dim = params.get('pred_ffn_dim', embed_dim * params.get('pred_ffn_mult', 2))
     fh_key       = params.get('future_horizon', 'medium')
     fh_min, fh_max = _FUTURE_HORIZON_MAP[fh_key]
+    stride_factor = params.get('stride_factor', 2)
     return [
         'conda', 'run', '-n', 'CHOROS',
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
         '--epochs',             str(final_epochs),
-        '--embed_eval_interval','10',
+        '--embed_eval_interval','5',
         '--eval_split_mode',    'test',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
         '--warmup_epochs',      str(_warmup_epochs_posejepa(final_epochs)),
-        '--val_fraction',       '0.1',
-        '--min_lr',             '1e-6',
+        '--val_fraction',       '0.15',
+        '--min_lr',             '1e-5',
         '--kinematics',         'PVAJ',
-        '--samples_per_epoch',  '512000',
+        '--samples_per_epoch',  '0',
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
-        '--eval_window_pool',   'mean',
+        '--eval_window_pool',   'stat9',
         '--eval_session_pool',  'mean',
+        # '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
+        '--eval_metrics',       'portScore', 'bot_dist_mean_s3',
+        '--stride_factor',      str(stride_factor),
         '--patch_size',         str(params['patch_size']),
         '--target_ratio',       str(params['target_ratio']),
         '--target_mode',        params['target_mode'],
@@ -945,6 +958,12 @@ def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: 
     print(f'Checkpoint: {ckpt}')
     print(f'{"="*72}\n')
 
+    # Compute embedding stride to match the final model's training eval stride.
+    # For posejepa: stride = max_len // stride_factor; others: use max_len // 2.
+    _max_len      = params.get('max_len', 128)
+    _stride_factor = params.get('stride_factor', 2)
+    _p3_stride    = _max_len // _stride_factor
+
     embed_script = str(_CHOROS_ROOT / 'pipeline' / 'embed_target_data.py')
     eval_targets = [
         (str(_DATA_ROOT / 'aligned' / 'target_FAB'),       'FAB', []),
@@ -956,12 +975,15 @@ def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: 
         p3_cmd = [
             'conda', 'run', '-n', 'CHOROS',
             'python', embed_script,
-            '--ckpt',        str(ckpt),
-            '--data_dir',    data_dir,
-            '--objective',   objective,
-            '--split_keys',  'train,val,test',
-            '--train_split', 'train+val',
-            '--eval_split',  'test',
+            '--ckpt',         str(ckpt),
+            '--data_dir',     data_dir,
+            '--objective',    objective,
+            '--stride',       str(_p3_stride),
+            '--window_pool',  'mean',
+            '--session_pool', 'mean',
+            '--split_keys',   'train,val,test',
+            '--train_split',  'train+val',
+            '--eval_split',   'test',
         ]
         if target_cols:
             p3_cmd += ['--target_cols'] + target_cols
@@ -999,12 +1021,26 @@ def parse_args():
     p.add_argument('--objective',      type=str, default='mae',
                    choices=['mae', 'tsjepa', 'posejepa'],
                    help='Training objective: mae (default), tsjepa, or posejepa')
+    p.add_argument('--batch_size',     type=int, default=None,
+                   help='Override GPU-profile batch size for all trial subprocesses')
+    p.add_argument('--num_workers',    type=int, default=None,
+                   help='Override GPU-profile num_workers for all trial subprocesses')
+    p.add_argument('--compile',        dest='compile', action='store_true', default=None,
+                   help='Enable torch.compile in trial subprocesses (overrides GPU profile)')
+    p.add_argument('--no_compile',     dest='compile', action='store_false',
+                   help='Disable torch.compile in trial subprocesses (overrides GPU profile)')
     return p.parse_args()
 
 
 def main():
     args    = parse_args()
     profile = _profile_for_gpu(args.gpu)
+    if args.batch_size is not None:
+        profile['batch_size'] = args.batch_size
+    if args.num_workers is not None:
+        profile['num_workers'] = args.num_workers
+    if args.compile is not None:
+        profile['compile'] = args.compile
     print_gpu_profile(profile)
     study   = create_study(args.study_name, args.worker_offset, args.storage)
 
