@@ -193,7 +193,8 @@ class VRDataset(Dataset):
         self._n = samples_per_epoch if samples_per_epoch > 0 else total_wins
         if verbose:
             print(f'\nDataset temperature sampling  alpha={sampling_alpha:.2f}  '
-                  f'({len(ds_names)} datasets  {total_wins:,} total windows)', flush=True)
+                  f'({len(ds_names)} datasets  {total_wins:,} total windows'
+                  f'  window_len={max_len})', flush=True)
             print(f"  {'Dataset':24s}  {'Windows':>12s}  {'Share':>7s}  {'Samples/ep':>11s}")
             print(f"  {'-'*62}")
             for ds in sorted(ds_names, key=lambda k: -self.sampling_shares[k]):
@@ -203,7 +204,8 @@ class VRDataset(Dataset):
             print(flush=True)
         else:
             print(f'Val pretraining set: {len(self.files):,} files  '
-                  f'{len(ds_names)} datasets  {total_wins:,} total windows', flush=True)
+                  f'{len(ds_names)} datasets  {total_wins:,} total windows'
+                  f'  window_len={max_len}', flush=True)
 
     @staticmethod
     def _npy_header(path: Path) -> tuple[int, int, int, bool]:
@@ -571,6 +573,7 @@ def _parse_group_mask_schedule(
 _PROBE_SUMMARY_RE = re.compile(
     r'\[Probe\] objective=(\w+)\s+target=(\S+)\s+split=(\w+)'
     r'\s+Balanced Acc\.\:\s*([\d.]+)'
+    r'(?:\s+Acc\.\:\s*[\d.]+)?'
     r'\s+MCC\:\s*(-?[\d.]+)'
     r'\s+F1\(macro\)\:\s*([\d.]+)'
     r'\s+ROC-AUC\:\s*([\d.]+)'

@@ -23,3 +23,7 @@ hf download nnchawla/CHOROS --repo-type=dataset --local-dir ./data
 
 
 #Note runpod key password is runpod
+
+tar -cf - /srv/CHOROS/data/kinematics/RW /srv/CHOROS/data/kinematics/VR | pv -s 140G | pigz > kinematics.tar.gz
+tar -cf - /srv/CHOROS/data/raw | pv -s 250G | pigz > raw.tar.gz
+tar -cf - /srv/CHOROS/data/aligned/RW /srv/CHOROS/data/aligned/VR | pv -s 50G | pigz > aligned.tar.gz

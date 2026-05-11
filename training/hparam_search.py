@@ -390,6 +390,7 @@ def _vram_monitor(gpu_id: int, peak_mb: list, stop_event: threading.Event) -> No
 _PROBE_SUMMARY_RE = re.compile(
     r'\[Probe\] objective=(\w+)\s+target=(\S+)\s+split=(\w+)'
     r'\s+Balanced Acc\.\:\s*([\d.]+)'
+    r'(?:\s+Acc\.\:\s*[\d.]+)?'
     r'\s+MCC\:\s*(-?[\d.]+)'
     r'\s+F1\(macro\)\:\s*([\d.]+)'
     r'\s+ROC-AUC\:\s*([\d.]+)'
