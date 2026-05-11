@@ -1,0 +1,98 @@
+• I studied the PoseJEPA implementation, training script, logs, and the real .npy headers.
+
+  Key Data Facts
+  Dataset: 71,372 files, 65.5M frames at 30 Hz. Mean sequence length is 918 frames, but the median is only 74 frames. The distribution is very skewed:
+
+  | Quantile | Frames | Seconds |
+  |---:|---:|---:|
+  | p25 | 35 | 1.2s |
+  | p50 | 74 | 2.5s |
+  | p75 | 166 | 5.5s |
+  | p90 | 310 | 10.3s |
+  | p95 | 1743 | 58.1s |
+  | p99 | 20447 | 681.6s |
+
+  So max_len=128 is a good default, but it pads 63.7% of files. Because the dataset samples windows as max(1, n_rows - max_len + 1) and uses sampling_alpha=0.5, long datasets still contribute many windows, but not as overwhelmingly as raw window count would imply. Code reference: training/
+  train_vr_encoder_pose_jepa.py:166.
+
+  Important Model Implication
+  PoseJEPA attends over patches, not frames. With the current max_len=128, patch_size=8, the model sees only:
+
+  128 frames / 8 frames = 16 tokens
+  target_ratio=0.25 => 4 target tokens
+
+  So attention is not the main compute bottleneck unless you use smaller patches or longer windows. Capacity is mostly controlled by embed_dim, n_layers, and FFN width. Code reference: src/vr_encoder_pose_jepa.py:316.
+
+  Recommended Size Sweep
+
+  | Size | embed_dim | n_heads | head dim | n_layers | ffn_dim | pred_layers | pred_ffn_dim | params total | trainable |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | Small | 192 | 4 | 48 | 4 | 768 | 2 | 384 | 4.4M | 2.5M |
+  | Medium | 384 | 6 | 64 | 6 | 1536 | 2 | 768 | 24.1M | 13.2M |
+  | Large | 512 | 8 | 64 | 8 | 2048 | 2 | 1024 | 55.3M | 29.7M |
+  | XL optional | 768 | 8 or 12 | 96 or 64 | 8 | 3072 | 2 | 1536 | 123.8M | 66.6M |
+
+  I would treat the current embed_dim=768, n_heads=6, n_layers=4 as wide but shallow. It is not invalid, but head_dim=128 gives fewer attention patterns than I’d want for a high-capacity run. For 768, I’d prefer n_heads=8 or 12.
+
+  Recommended Window/Patch Sweep
+
+  Use these as the temporal sweep, preferably on the medium model first:
+
+  | Purpose | max_len | patch_size | tokens | target tokens @ 0.25 | Meaning |
+  |---|---:|---:|---:|---:|---|
+  | Short/fine | 64 | 4 | 16 | 4 | 2.1s windows, 133ms patches |
+  | Default | 128 | 8 | 16 | 4 | 4.3s windows, 267ms patches |
+  | Long context | 256 | 8 | 32 | 8 | 8.5s windows, 267ms patches |
+  | Fine default optional | 128 | 4 | 32 | 8 | 4.3s windows, finer dynamics |
+
+  Avoid max_len=32, patch_size=4 for serious runs unless debugging. That gives only 8 tokens, and low target ratios can collapse into 1 target token, which is too easy for this JEPA objective.
+
+  Batch Size / LR
+  For full epochs, the dataset is huge. Logs show about 50.7M training windows for max_len=128 with the current 15% validation split, so:
+
+  bs=512  -> ~99k batches/epoch
+  bs=1024 -> ~49.5k batches/epoch
+  bs=2048 -> ~24.8k batches/epoch
+  bs=4096 -> ~12.4k batches/epoch
+
+  On a 24GB 3090-style GPU, I’d start with:
+
+  | Size | Batch size | LR |
+  |---|---:|---:|
+  | Small | 2048 or 4096 | 4e-4 to 8e-4 |
+  | Medium | 1024 or 2048 | 3e-4 to 6e-4 |
+  | Large | 512 or 1024 | 2e-4 to 4e-4 |
+  | XL | 256 to 512 | 1e-4 to 3e-4 |
+
+  I would not use lr=0.03; one log with dim512/l8/bs4096/lr0.03 produced poor probe behavior despite low JEPA loss. Your older stable baseline around dim256/l6/bs512/lr4e-4 is a better anchor.
+
+  Concrete Starting Grid
+  I’d run this in two phases.
+
+  Phase 1, fixed temporal setup:
+
+  max_len=128
+  patch_size=8
+  target_ratio=0.25
+  target_mode=masked_span
+  n_target_blocks=2
+  dropout=0.05
+  ema_start=0.999
+  ffn_dim=4*embed_dim
+  pred_ffn_dim=2*embed_dim
+  pred_layers=2
+
+  Then sweep:
+
+  small:  --embed_dim 192 --n_heads 4 --n_layers 4 --ffn_dim 768  --pred_ffn_dim 384  --batch_size 2048 --lr 6e-4
+  medium: --embed_dim 384 --n_heads 6 --n_layers 6 --ffn_dim 1536 --pred_ffn_dim 768  --batch_size 1024 --lr 4e-4
+  large:  --embed_dim 512 --n_heads 8 --n_layers 8 --ffn_dim 2048 --pred_ffn_dim 1024 --batch_size 512  --lr 3e-4
+
+  Phase 2, keep the best size and sweep temporal resolution:
+
+  --max_len 64  --patch_size 4
+  --max_len 128 --patch_size 8
+  --max_len 256 --patch_size 8
+  --max_len 128 --patch_size 4
+
+  My default recommendation: start with the medium config at max_len=128, patch_size=8, then test 256/8. The dataset has enough total frames for larger models, but the file-level median is short, so going larger than 512d/8L before proving benefit from longer/finer windows is probably wasted compute.

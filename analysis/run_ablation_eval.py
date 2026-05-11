@@ -42,7 +42,7 @@ from splits import filter_devcom_files, filter_fab_files
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_8_26_24_epochs")
+BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_10_26_masking_ablations")
 EMBED_OUT = REPO / 'outputs' / 'embeddings'
 JSON_OUT  = BASE / "ablation_eval_results.json"
 TXT_OUT   = BASE / "ablation_eval_summary.txt"
@@ -186,7 +186,7 @@ def parse_all_probe_lines(output: str) -> dict[str, dict]:
     """Return {cmd_id: metrics_dict} for every [Probe] test line in output."""
     pat = (
         r'\[Probe\] objective=(\S+) target=(\S+) split=test '
-        r'Balanced Acc\.: ([\d.]+)\s+MCC: ([-\d.]+)\s+'
+        r'Balanced Acc\.: ([\d.]+)\s+Acc\.: ([\d.]+)\s+MCC: ([-\d.]+)\s+'
         r'F1\(macro\): ([\d.]+)\s+ROC-AUC: ([\d.]+)'
     )
     results = {}
@@ -200,9 +200,10 @@ def parse_all_probe_lines(output: str) -> dict[str, dict]:
                     'objective':    m.group(1),
                     'target':       target,
                     'balanced_acc': float(m.group(3)),
-                    'mcc':          float(m.group(4)),
-                    'f1_macro':     float(m.group(5)),
-                    'roc_auc':      float(m.group(6)),
+                    'acc':          float(m.group(4)),
+                    'mcc':          float(m.group(5)),
+                    'f1_macro':     float(m.group(6)),
+                    'roc_auc':      float(m.group(7)),
                 }
     return results
 
@@ -232,7 +233,7 @@ def _eval_checkpoint(
     sp:          str,
     stride:      int,
     tag:         str,
-) -> dict[str, dict | None]:
+) -> tuple[dict[str, dict | None], Path, Path]:
     """Embed DEVCOM+FAB with one checkpoint (shared model load) then run probes.
 
     Returns {cmd_id: metrics_or_None} for D3_bot_dist, D3_firing, and FAB.
@@ -263,7 +264,7 @@ def _eval_checkpoint(
         metrics = parse_all_probe_lines(out).get(cmd_id)
         results[cmd_id] = metrics
         if metrics:
-            _log(f"  DONE   {tag}/{cmd_id:30s}  MCC={metrics['mcc']:.4f}  BAcc={metrics['balanced_acc']:.4f}")
+            _log(f"  DONE   {tag}/{cmd_id:30s}  MCC={metrics['mcc']:.4f}  BAcc={metrics['balanced_acc']:.4f}  Acc={metrics.get('acc', float('nan')):.4f}")
         else:
             _log(f"  WARN   {tag}/{cmd_id:30s}  no [Probe] test line")
             for ln in [ln for ln in out.splitlines() if ln.strip()][-4:]:
@@ -273,13 +274,13 @@ def _eval_checkpoint(
     metrics = parse_all_probe_lines(out).get('FAB')
     results['FAB'] = metrics
     if metrics:
-        _log(f"  DONE   {tag}/{'FAB':30s}  MCC={metrics['mcc']:.4f}  BAcc={metrics['balanced_acc']:.4f}")
+        _log(f"  DONE   {tag}/{'FAB':30s}  MCC={metrics['mcc']:.4f}  BAcc={metrics['balanced_acc']:.4f}  Acc={metrics.get('acc', float('nan')):.4f}")
     else:
         _log(f"  WARN   {tag}/{'FAB':30s}  no [Probe] test line")
         for ln in [ln for ln in out.splitlines() if ln.strip()][-4:]:
             _log(f"    > {ln}")
 
-    return results
+    return results, devcom_emb, fab_emb
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Formatting helpers
@@ -315,18 +316,19 @@ def format_per_run(results: dict) -> str:
         for ckpt in ckpts:
             cmd_data = run_data[ckpt]
             lines.append(f"\n  [{shorten_ckpt(ckpt)}]")
-            lines.append(f"  {'Command':<22}  {'Bal.Acc':>8} {'MCC':>8} {'F1(mac)':>8} {'ROC-AUC':>8}")
-            lines.append("  " + "-" * 58)
+            lines.append(f"  {'Command':<22}  {'Bal.Acc':>8} {'Acc':>8} {'MCC':>8} {'F1(mac)':>8} {'ROC-AUC':>8}")
+            lines.append("  " + "-" * 68)
             for cmd_id, label in CMD_ORDER:
                 m = cmd_data.get(cmd_id)
                 if m:
                     lines.append(
                         f"  {label:<22}  "
-                        f"{fmt_val(m['balanced_acc'], 8)} {fmt_val(m['mcc'], 8)} "
+                        f"{fmt_val(m['balanced_acc'], 8)} {fmt_val(m.get('acc'), 8)} "
+                        f"{fmt_val(m['mcc'], 8)} "
                         f"{fmt_val(m['f1_macro'], 8)} {fmt_val(m['roc_auc'], 8)}"
                     )
                 else:
-                    lines.append(f"  {label:<22}  {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8}")
+                    lines.append(f"  {label:<22}  {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8}")
     return "\n".join(lines)
 
 def format_cross_run(results: dict, metric: str = 'mcc') -> str:
@@ -353,6 +355,113 @@ def format_cross_run(results: dict, metric: str = 'mcc') -> str:
         row += "  ".join(vals)
         lines.append(row)
     return "\n".join(lines)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Probability histograms for best checkpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PROBE_CSV_MAP = {
+    'D3_bot_dist': ('_devcom_emb_dir', 'linear_probe_D3_bot_dist_mean_s3.csv',  'bot_dist_mean_s3'),
+    'D3_firing':   ('_devcom_emb_dir', 'linear_probe_D3_firing_accuracy_AOBJ_s3.csv', 'firing_accuracy_AOBJ_s3'),
+    'FAB':         ('_fab_emb_dir',    'linear_probe_FAB_portScore.csv',         'expertiseScore'),
+}
+
+def _save_prob_histograms(all_results: dict, out_dir: Path) -> None:
+    """For each run, find the checkpoint with the highest average ROC-AUC across
+    all three probes, then save a histogram of predicted probabilities (split by
+    true label) for those checkpoints."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    preds_root = REPO / 'outputs' / 'predictions'
+    probe_ids  = [cmd_id for cmd_id, _ in CMD_ORDER]
+
+    # Best checkpoint per run
+    best_per_run: list[tuple[str, str, float]] = []
+    for run_name, _ in RUNS:
+        run_data = all_results.get(run_name, {})
+        best_auc, best_ckpt = -1.0, None
+        for ckpt_stem, ckpt_data in run_data.items():
+            if ckpt_stem.startswith('_'):
+                continue
+            aucs = [
+                ckpt_data[cid]['roc_auc']
+                for cid in probe_ids
+                if isinstance(ckpt_data.get(cid), dict)
+            ]
+            if not aucs:
+                continue
+            avg = float(np.mean(aucs))
+            if avg > best_auc:
+                best_auc, best_ckpt = avg, ckpt_stem
+        if best_ckpt:
+            best_per_run.append((run_name, best_ckpt, best_auc))
+
+    if not best_per_run:
+        print("\nNo results available for histograms.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nGenerating probability histograms for {len(best_per_run)} best checkpoint(s)...")
+
+    for run_name, ckpt_stem, avg_auc in best_per_run:
+        ckpt_data = all_results[run_name][ckpt_stem]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle(
+            f"{run_name}  /  {shorten_ckpt(ckpt_stem)}\n"
+            f"Avg ROC-AUC = {avg_auc:.4f}",
+            fontsize=12,
+        )
+
+        for ax, (cmd_id, label) in zip(axes, CMD_ORDER):
+            emb_key, csv_name, target_display = _PROBE_CSV_MAP[cmd_id]
+            emb_dir_str = ckpt_data.get(emb_key)
+            if not emb_dir_str:
+                ax.text(0.5, 0.5, 'emb dir not recorded\n(cached run)', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=9)
+                ax.set_title(label)
+                continue
+
+            csv_path = preds_root / Path(emb_dir_str).name / csv_name
+            if not csv_path.exists():
+                ax.text(0.5, 0.5, f'CSV not found:\n{csv_name}', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=8)
+                ax.set_title(label)
+                continue
+
+            df = pd.read_csv(csv_path)
+            if 'target_col' in df.columns:
+                df = df[df['target_col'] == target_display]
+            if 'prob_med_pos' not in df.columns or len(df) == 0:
+                ax.text(0.5, 0.5, 'No prob_med_pos column', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=9)
+                ax.set_title(label)
+                continue
+
+            df = df.dropna(subset=['prob_med_pos', 'label_median'])
+            auc_val = (ckpt_data.get(cmd_id) or {}).get('roc_auc', float('nan'))
+            for cls_val, cls_name, color in [(0, 'Low', '#4477AA'), (1, 'High', '#EE6677')]:
+                mask = df['label_median'] == cls_val
+                if mask.sum() > 0:
+                    ax.hist(df.loc[mask, 'prob_med_pos'], bins=20, alpha=0.65,
+                            label=f'{cls_name} (n={int(mask.sum())})', color=color, density=True)
+            ax.set_xlabel('P(high class)')
+            ax.set_ylabel('Density')
+            ax.set_title(f"{label}\nROC-AUC = {auc_val:.4f}")
+            ax.legend(fontsize=8)
+            ax.set_xlim(0, 1)
+
+        plt.tight_layout()
+        safe_name = f"hist_{run_name}_{shorten_ckpt(ckpt_stem)}".replace('/', '_').replace(' ', '_')
+        fig_path  = out_dir / f"{safe_name}.png"
+        plt.savefig(fig_path, dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  {run_name}/{shorten_ckpt(ckpt_stem)}  avg_auc={avg_auc:.4f}  → {fig_path.name}")
+
+    print(f"Histograms → {out_dir}")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -455,9 +564,11 @@ def main():
             for future in as_completed(run_futures):
                 ckpt_stem = run_futures[future]
                 try:
-                    results = future.result()
+                    results, devcom_emb, fab_emb = future.result()
                     with json_lock:
                         all_results[run_name][ckpt_stem].update(results)
+                        all_results[run_name][ckpt_stem]['_devcom_emb_dir'] = str(devcom_emb)
+                        all_results[run_name][ckpt_stem]['_fab_emb_dir']    = str(fab_emb)
                         with open(JSON_OUT, 'w') as jf:
                             json.dump(all_results, jf, indent=2)
                 except Exception as e:
@@ -466,7 +577,7 @@ def main():
     # ── Final summary ──────────────────────────────────────────────────────────
     summary = ["ABLATION EVALUATION RESULTS", "=" * 90,
                format_per_run(all_results), "\n\n"]
-    for metric in ("mcc", "balanced_acc", "f1_macro", "roc_auc"):
+    for metric in ("mcc", "balanced_acc", "acc", "f1_macro", "roc_auc"):
         summary.append(format_cross_run(all_results, metric))
         summary.append("")
 
@@ -478,6 +589,8 @@ def main():
 
     print(f"\nJSON results → {JSON_OUT}")
     print(f"Text summary → {TXT_OUT}")
+
+    _save_prob_histograms(all_results, BASE / "histograms")
 
 
 if __name__ == "__main__":

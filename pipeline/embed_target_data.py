@@ -666,8 +666,9 @@ def embed_and_probe(args) -> list[Path]:
     out_dir   = Path(args.out_dir)
     objective = args.objective
     split_keys_raw = getattr(args, 'split_keys', None)
-    probe_train_split = getattr(args, 'train_split', None)
-    probe_eval_split  = getattr(args, 'eval_split', None)
+    probe_train_split  = getattr(args, 'train_split', None)
+    probe_eval_split   = getattr(args, 'eval_split', None)
+    probe_no_train_median = getattr(args, 'no_train_median', False)
 
     if (probe_train_split is None) != (probe_eval_split is None):
         raise ValueError('--train_split and --eval_split must be provided together')
@@ -752,6 +753,8 @@ def embed_and_probe(args) -> list[Path]:
                 cmd += ['--train_split', probe_train_split]
             if probe_eval_split:
                 cmd += ['--eval_split', probe_eval_split]
+            if probe_no_train_median:
+                cmd += ['--no_train_median']
             result = subprocess.run(cmd, capture_output=True, text=True)
             print(result.stdout)
             if result.returncode != 0:
@@ -823,6 +826,8 @@ def parse_args():
                         "After each pool config, runs a dataset identity probe combining the "
                         "current output with any peer whose dir name ends with the same pool suffix. "
                         "Example: /path/to/DEVCOM_emb:DEVCOM,/path/to/other_FAB_emb:FAB2")
+    p.add_argument('--no_train_median', action='store_true', default=False,
+                   help='Use population median as threshold (default: train-split median).')
     return p.parse_args()
 
 
