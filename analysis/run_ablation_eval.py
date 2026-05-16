@@ -3,8 +3,8 @@
 Run ablation evaluations and aggregate results.
 
 For each run directory, parquet data for DEVCOM and FAB is loaded once per run,
-then reused across all checkpoints (checkpoint_best, checkpoint_latest, and the
-best-probe checkpoints).  For each checkpoint:
+then reused across selected checkpoints (latest, best, and best-probe-val).
+For each checkpoint:
   - Both datasets are embedded in-process (reusing the loaded model for both).
   - Probes for D3/bot_dist, D3/firing, and FAB are run as subprocesses.
 
@@ -42,7 +42,7 @@ from splits import filter_devcom_files, filter_fab_files
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_10_26_masking_ablations")
+BASE      = Path("/srv/CHOROS_AUTO/outputs/checkpoints/5_13_26_back_to_it")
 EMBED_OUT = REPO / 'outputs' / 'embeddings'
 JSON_OUT  = BASE / "ablation_eval_results.json"
 TXT_OUT   = BASE / "ablation_eval_summary.txt"
@@ -51,12 +51,24 @@ DEVCOM_DIR  = Path("/srv/CHOROS/data/aligned/target_DEVCOM_s2")
 FAB_DIR     = Path("/srv/CHOROS/data/aligned/target_FAB")
 SPLIT_KEYS  = ['train', 'val', 'test']
 
-# GPU slots: repeat an index for multiple concurrent jobs on that GPU.
-# dim=256 / 6-layer model uses ~500 MB VRAM per job; 3090 (24 GB) fits 4+.
-GPU_IDS = [0, 0, 0, 0, 1, 1]
+def _parse_gpu_ids() -> list[int]:
+    raw = os.environ.get('ABLATION_GPU_IDS', '0,1')
+    ids = [int(x.strip()) for x in raw.split(',') if x.strip()]
+    return ids or [0]
+
+
+# GPU slots. Override with ABLATION_GPU_IDS="0,0,1,1" if profiling shows multiple
+# concurrent embedding jobs per GPU improves throughput on the current hardware.
+GPU_IDS = _parse_gpu_ids()
 
 _N_CPU        = os.cpu_count() or 4
 _PROBE_N_JOBS = max(1, _N_CPU // len(GPU_IDS))
+
+CHECKPOINT_ALLOWLIST = {
+    "checkpoint_latest",
+    "checkpoint_best",
+    "checkpoint_best_probe_val",
+}
 
 def _discover_runs(base: Path) -> list[tuple[str, str]]:
     """Discover run directories under base and assign names from GPU type and index.
@@ -93,7 +105,12 @@ def _discover_runs(base: Path) -> list[tuple[str, str]]:
 RUNS = _discover_runs(BASE)
 
 def get_checkpoints(dir_path: Path) -> list[str]:
-    return sorted(p.stem for p in dir_path.glob("checkpoint_*.pt"))
+    checkpoints = [p.stem for p in dir_path.glob("checkpoint_*.pt")]
+    return sorted(
+        (c for c in checkpoints if shorten_ckpt(c) in CHECKPOINT_ALLOWLIST),
+        key=lambda c: CKPT_SHORT_ORDER.index(shorten_ckpt(c))
+        if shorten_ckpt(c) in CKPT_SHORT_ORDER else 99,
+    )
 
 # Result cmd_ids in display order
 CMD_ORDER = [
@@ -171,7 +188,8 @@ def _probe_subprocess(emb_dir: Path, objective: str, target_col: str | None) -> 
            '--emb-dir',     str(emb_dir),
            '--objective',   objective,
            '--train_split', 'train+val',
-           '--eval_split',  'test']
+           '--eval_split',  'test',
+           '--classification-only']
     if target_col:
         cmd += ['--target-col', target_col]
     r = subprocess.run(cmd, capture_output=True, text=True,
@@ -217,6 +235,10 @@ def _log(msg: str) -> None:
     with _print_lock:
         print(msg, flush=True)
 
+
+def _safe_name(text: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', text)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-checkpoint worker (called from thread pool)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -246,10 +268,16 @@ def _eval_checkpoint(
     devcom_emb = embed_all_preloaded(
         devcom_raw, DEVCOM_DIR.name, ckpt_file, EMBED_OUT,
         stride, bs, wp, sp, model=model, ckpt=ckpt_data,
+        cache_stem=_safe_name(
+            f"ablation_eval_{BASE.name}_{run_name}_{ckpt_stem}_{DEVCOM_DIR.name}"
+        ),
     )
     fab_emb = embed_all_preloaded(
         fab_raw, FAB_DIR.name, ckpt_file, EMBED_OUT,
         stride, bs, wp, sp, model=model, ckpt=ckpt_data,
+        cache_stem=_safe_name(
+            f"ablation_eval_{BASE.name}_{run_name}_{ckpt_stem}_{FAB_DIR.name}"
+        ),
     )
 
     # Free GPU before CPU-bound probe
@@ -258,9 +286,16 @@ def _eval_checkpoint(
 
     results: dict[str, dict | None] = {}
 
-    for target_col, cmd_id in [('bot_dist_mean_s3',        'D3_bot_dist'),
-                                ('firing_accuracy_AOBJ_s3', 'D3_firing')]:
-        out     = _probe_subprocess(devcom_emb, 'D3', target_col)
+    # Launch all 3 probes concurrently — D3_bot_dist, D3_firing, and FAB are independent.
+    _probe_pool = ThreadPoolExecutor(max_workers=3)
+    probe_futures = {
+        _probe_pool.submit(_probe_subprocess, devcom_emb, 'D3', 'bot_dist_mean_s3'):        'D3_bot_dist',
+        _probe_pool.submit(_probe_subprocess, devcom_emb, 'D3', 'firing_accuracy_AOBJ_s3'): 'D3_firing',
+        _probe_pool.submit(_probe_subprocess, fab_emb,    'FAB', None):                     'FAB',
+    }
+    for f in as_completed(probe_futures):
+        cmd_id  = probe_futures[f]
+        out     = f.result()
         metrics = parse_all_probe_lines(out).get(cmd_id)
         results[cmd_id] = metrics
         if metrics:
@@ -269,16 +304,7 @@ def _eval_checkpoint(
             _log(f"  WARN   {tag}/{cmd_id:30s}  no [Probe] test line")
             for ln in [ln for ln in out.splitlines() if ln.strip()][-4:]:
                 _log(f"    > {ln}")
-
-    out     = _probe_subprocess(fab_emb, 'FAB', None)
-    metrics = parse_all_probe_lines(out).get('FAB')
-    results['FAB'] = metrics
-    if metrics:
-        _log(f"  DONE   {tag}/{'FAB':30s}  MCC={metrics['mcc']:.4f}  BAcc={metrics['balanced_acc']:.4f}  Acc={metrics.get('acc', float('nan')):.4f}")
-    else:
-        _log(f"  WARN   {tag}/{'FAB':30s}  no [Probe] test line")
-        for ln in [ln for ln in out.splitlines() if ln.strip()][-4:]:
-            _log(f"    > {ln}")
+    _probe_pool.shutdown(wait=False)
 
     return results, devcom_emb, fab_emb
 
@@ -289,15 +315,15 @@ def _eval_checkpoint(
 def fmt_val(v, width=7):
     return f"{v:>{width}.4f}" if isinstance(v, float) else f"{'N/A':>{width}}"
 
+def metric_val(m: dict | None, key: str):
+    return m.get(key) if isinstance(m, dict) else None
+
 def shorten_ckpt(name: str) -> str:
     return re.sub(r'_wp_.+', '', name)
 
 CKPT_SHORT_ORDER = [
-    "checkpoint_best",
     "checkpoint_latest",
-    "checkpoint_best_probe_bot_dist",
-    "checkpoint_best_probe_firing",
-    "checkpoint_best_probe_port_score",
+    "checkpoint_best",
     "checkpoint_best_probe_val",
 ]
 
@@ -323,9 +349,11 @@ def format_per_run(results: dict) -> str:
                 if m:
                     lines.append(
                         f"  {label:<22}  "
-                        f"{fmt_val(m['balanced_acc'], 8)} {fmt_val(m.get('acc'), 8)} "
-                        f"{fmt_val(m['mcc'], 8)} "
-                        f"{fmt_val(m['f1_macro'], 8)} {fmt_val(m['roc_auc'], 8)}"
+                        f"{fmt_val(metric_val(m, 'balanced_acc'), 8)} "
+                        f"{fmt_val(metric_val(m, 'acc'), 8)} "
+                        f"{fmt_val(metric_val(m, 'mcc'), 8)} "
+                        f"{fmt_val(metric_val(m, 'f1_macro'), 8)} "
+                        f"{fmt_val(metric_val(m, 'roc_auc'), 8)}"
                     )
                 else:
                     lines.append(f"  {label:<22}  {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8}")
@@ -351,7 +379,8 @@ def format_cross_run(results: dict, metric: str = 'mcc') -> str:
         for short, cmd_id in col_keys:
             full = short_to_full.get(short)
             m = run_data.get(full, {}).get(cmd_id) if full else None
-            vals.append(f"{m[metric]:>{col_w}.4f}" if m else f"{'N/A':>{col_w}}")
+            v = metric_val(m, metric)
+            vals.append(f"{v:>{col_w}.4f}" if isinstance(v, float) else f"{'N/A':>{col_w}}")
         row += "  ".join(vals)
         lines.append(row)
     return "\n".join(lines)

@@ -4,9 +4,9 @@ Bayesian hyperparameter search for VR motion encoder (MAE, TS-JEPA, or Pose-JEPA
 Uses Optuna with TPE sampler.  Each trial runs the relevant training script as
 an isolated subprocess for 10 epochs with --eval_window_pool mean
 --eval_session_pool mean (single pool for speed), then parses epoch-10 output
-to extract arithmetic mean MCC across 3 downstream objectives.
+to extract arithmetic mean ROC-AUC across 3 downstream objectives.
 
-Aggregate metric: arithmetic mean of val MCC across
+Aggregate metric: arithmetic mean of val ROC-AUC across
   FAB portScore / DEVCOM bot_dist_mean_s3 / firing_accuracy_AOBJ_s3
   (flag_incidents_s3 excluded: severe val-set class imbalance, 13/4 split)
 
@@ -65,6 +65,13 @@ import torch
 # All embed_dim choices (64, 128, 192, 256) are divisible by both 4 and 8,
 # so restricting to [4, 8] avoids Optuna's CategoricalDistribution dynamic-space error.
 _N_HEADS_CHOICES = [4, 8]
+
+# Architecture presets for Pose-JEPA model_shape hyperparameter.
+_MODEL_SHAPES_POSEJEPA: dict[str, dict] = {
+    'small':  {'embed_dim': 128, 'ffn_dim': 512,  'pred_ffn_dim': 256,  'n_heads': 4, 'n_layers': 4},
+    'medium': {'embed_dim': 258, 'ffn_dim': 1032, 'pred_ffn_dim': 516,  'n_heads': 6, 'n_layers': 6},
+    'large':  {'embed_dim': 512, 'ffn_dim': 2048, 'pred_ffn_dim': 1024, 'n_heads': 8, 'n_layers': 8},
+}
 
 # Translates feature_group_mask choice to --feature_group_mask CLI args
 _FEATURE_MASK_ARGS = {
@@ -135,15 +142,9 @@ def sample_hyperparams_tsjepa(trial: optuna.Trial) -> dict:
 
 
 def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
-    embed_dim   = trial.suggest_categorical('embed_dim', [64])
-    # n_heads     = trial.suggest_categorical('n_heads', _N_HEADS_CHOICES)
-    n_heads     = trial.suggest_categorical('n_heads', [2])
+    model_shape = trial.suggest_categorical('model_shape', list(_MODEL_SHAPES_POSEJEPA))
+    shape       = _MODEL_SHAPES_POSEJEPA[model_shape]
     target_mode = trial.suggest_categorical('target_mode', ['masked_span'])
-
-    # ffn_dim and pred_ffn_dim expressed as multiples of embed_dim so Optuna
-    # reasons about them in a scale-invariant way.
-    ffn_mult      = trial.suggest_categorical('ffn_mult', [2])
-    pred_ffn_mult = trial.suggest_categorical('pred_ffn_mult', [1])
 
     # future_min_gap and future_horizon only matter when future paths are possible.
     uses_future = target_mode in ('future', 'mixed')
@@ -157,32 +158,28 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
     )
 
     return {
-        'patch_size':       trial.suggest_categorical('patch_size', [8]),
-        'target_ratio':     trial.suggest_float('target_ratio', 0.1, 0.5, step=0.05),
-        # 'target_ratio':     trial.suggest_categorical('target_ratio', [0.25]),
+        'model_shape':      model_shape,
+        'patch_size':       trial.suggest_categorical('patch_size', [4, 6, 8]),
+        'target_ratio':     trial.suggest_categorical('target_ratio', [0.3, 0.45, 0.6, 0.75]),
         'target_mode':      target_mode,
-        # 'n_target_blocks':  trial.suggest_int('n_target_blocks', 1, 4) if target_mode != 'future' else 2,
         'n_target_blocks':  trial.suggest_categorical('n_target_blocks', [2]),
         'future_min_gap':   future_min_gap,
         'future_horizon':   future_horizon,
-        'ema_start':        trial.suggest_categorical('ema_start', [0.996, 0.997, 0.998, 0.999]),
-        # 'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
-        'pred_layers':      trial.suggest_categorical('pred_layers', [1]),
-        'pred_ffn_mult':    pred_ffn_mult,
-        'pred_ffn_dim':     embed_dim * pred_ffn_mult,
-        'latent_loss':      trial.suggest_categorical('latent_loss', ['smooth_l1']),
-        'lr':               trial.suggest_float('lr', 5e-5, 5e-3, log=True),
-        # 'sampling_alpha':   trial.suggest_float('sampling_alpha', 0.4, 0.6),
-        'sampling_alpha':   trial.suggest_categorical('sampling_alpha', [0.5]),
-        'dropout':          0.05,
-        'embed_dim':        embed_dim,
-        'n_heads':          n_heads,
-        # 'n_layers':         trial.suggest_int('n_layers', 4, 8),
-        'n_layers':         trial.suggest_categorical('n_layers', [2]),
-        'ffn_mult':         ffn_mult,
-        'ffn_dim':          embed_dim * ffn_mult,
-        # max_len in {128} — divisible by patch_size in {8, 16}
-        'max_len':          trial.suggest_categorical('max_len', [32, 64, 128, 192, 256]),
+        'ema_start':        trial.suggest_categorical('ema_start', [0.993, 0.995, 0.997, 0.999]),
+        'pred_layers':      trial.suggest_categorical('pred_layers', [2]),
+        'pred_ffn_dim':     shape['pred_ffn_dim'],
+        'latent_loss':        trial.suggest_categorical('latent_loss', ['smooth_l1']),
+        'lr':                 trial.suggest_categorical('lr', [1e-5, 5e-5, 1e-4, 5e-4]),
+        'sampling_alpha':     trial.suggest_categorical('sampling_alpha', [0.25, 0.50, 0.75]),
+        'dropout':            trial.suggest_categorical('dropout', [0.0, 0.05, 0.1, 0.2]),
+        'embed_dim':          shape['embed_dim'],
+        'n_heads':            shape['n_heads'],
+        'n_layers':           shape['n_layers'],
+        'ffn_dim':            shape['ffn_dim'],
+        # max_len must be divisible by patch_size (8)
+        'max_len':            trial.suggest_categorical('max_len', [64, 96, 128, 256]),
+        'samples_per_epoch':  trial.suggest_categorical('samples_per_epoch', [256000, 512000, 1024000]),
+        'eval_window_pool':   trial.suggest_categorical('eval_window_pool', ['mean', 'mean_std_max', 'stat9']),
     }
 
 
@@ -322,23 +319,22 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '100',
+        '--epochs',             '50',
         '--embed_eval_interval','5',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
-        '--warmup_epochs',      str(_warmup_epochs_posejepa(100)),
+        '--warmup_epochs',      str(_warmup_epochs_posejepa(50)),
         '--val_fraction',       '0.15',
         '--min_lr',             '1e-6',
         '--kinematics',         'PVAJ',
-        '--samples_per_epoch',  '0',
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
-        '--eval_window_pool',   'stat9',
         '--eval_session_pool',  'mean',
         '--eval_split_mode',    'val',
-        # '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
-        '--eval_metrics',       'portScore', 'bot_dist_mean_s3',
+        '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
+        '--samples_per_epoch',  str(params['samples_per_epoch']),
+        '--eval_window_pool',   params['eval_window_pool'],
         '--stride_factor',      '2',
         '--patch_size',         str(params['patch_size']),
         '--target_ratio',       str(params['target_ratio']),
@@ -426,8 +422,8 @@ def parse_eval_output(text: str) -> dict[str, dict]:
 
 def aggregate_metric(metrics: dict[str, dict]) -> float:
     keys = ['portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']
-    mccs = [metrics[k]['mcc'] for k in keys]
-    return sum(mccs) / len(mccs)
+    aucs = [metrics[k]['auc'] for k in keys]
+    return sum(aucs) / len(aucs)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +440,7 @@ def _log_trial_summary(
 ) -> None:
     fgm  = params['feature_group_mask']
     vram = f'{peak_vram_gb:.1f}GB' if peak_vram_gb > 0 else 'N/A'
-    def _a(key): return metrics.get(key, {}).get('mcc', float('nan'))
+    def _a(key): return metrics.get(key, {}).get('auc', float('nan'))
     print(
         f"[T {trial.number:03d}] score={score:.4f} | "
         f"fab={_a('portScore'):.4f} "
@@ -577,7 +573,7 @@ def _log_trial_summary_tsjepa(
 ) -> None:
     fgm  = params['feature_group_mask']
     vram = f'{peak_vram_gb:.1f}GB' if peak_vram_gb > 0 else 'N/A'
-    def _a(key): return metrics.get(key, {}).get('mcc', float('nan'))
+    def _a(key): return metrics.get(key, {}).get('auc', float('nan'))
     print(
         f"[T {trial.number:03d}] score={score:.4f} | "
         f"fab={_a('portScore'):.4f} "
@@ -612,7 +608,7 @@ def _log_trial_summary_posejepa(
     peak_vram_gb: float,
 ) -> None:
     vram = f'{peak_vram_gb:.1f}GB' if peak_vram_gb > 0 else 'N/A'
-    def _a(key): return metrics.get(key, {}).get('mcc', float('nan'))
+    def _a(key): return metrics.get(key, {}).get('auc', float('nan'))
     tmode = params['target_mode']
     future_info = (
         f"fmg={params['future_min_gap']} fh={params['future_horizon']} "
@@ -628,13 +624,12 @@ def _log_trial_summary_posejepa(
         f"tmode={tmode} "
         f"tr={params['target_ratio']:.3f} "
         f"{future_info}"
+        f"shape={params['model_shape']} "
         f"loss={params['latent_loss']} "
         f"lr={params['lr']:.2e} "
-        f"dim={params['embed_dim']} "
-        f"h={params['n_heads']} "
-        f"l={params['n_layers']} "
-        f"ffn={params['ffn_dim']} "
         f"ml={params['max_len']} "
+        f"spe={params['samples_per_epoch']} "
+        f"wp={params['eval_window_pool']} "
         f"sa={params['sampling_alpha']:.2f} "
         f"ema={params['ema_start']} "
         f"pred={params['pred_layers']}x{params['pred_ffn_dim']} | "
@@ -723,26 +718,26 @@ def _print_best_trial(study: optuna.Study) -> None:
 
     best = study.best_trial
     print(f'\nBest trial: #{best.number}   score={best.value:.4f}')
-    print(f'  FAB portScore:           mcc={best.user_attrs.get("fab_val_mcc", float("nan")):.4f}  '
-          f'bacc={best.user_attrs.get("fab_val_bacc", float("nan")):.4f}')
-    print(f'  DEVCOM bot_dist:         mcc={best.user_attrs.get("bot_val_mcc", float("nan")):.4f}  '
-          f'bacc={best.user_attrs.get("bot_val_bacc", float("nan")):.4f}')
-    print(f'  DEVCOM firing_accuracy:  mcc={best.user_attrs.get("firing_val_mcc", float("nan")):.4f}  '
-          f'bacc={best.user_attrs.get("firing_val_bacc", float("nan")):.4f}')
+    print(f'  FAB portScore:           auc={best.user_attrs.get("fab_val_auc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("fab_val_mcc", float("nan")):.4f}')
+    print(f'  DEVCOM bot_dist:         auc={best.user_attrs.get("bot_val_auc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("bot_val_mcc", float("nan")):.4f}')
+    print(f'  DEVCOM firing_accuracy:  auc={best.user_attrs.get("firing_val_auc", float("nan")):.4f}  '
+          f'mcc={best.user_attrs.get("firing_val_mcc", float("nan")):.4f}')
     print(f'  Peak VRAM: {best.user_attrs.get("peak_vram_gb", "N/A")} GB')
     print('  Params:')
     for k, v in sorted(best.params.items()):
         print(f'    {k:25s} = {v}')
 
-    print(f'\nTop 5 by aggregate score (arithmetic mean val MCC):')
-    print(f'  {"Rank":4s}  {"Trial":5s}  {"score":6s}  {"fab_mcc":8s}  '
-          f'{"bot_mcc":8s}  {"firing_mcc":10s}')
+    print(f'\nTop 5 by aggregate score (arithmetic mean val AUC):')
+    print(f'  {"Rank":4s}  {"Trial":5s}  {"score":6s}  {"fab_auc":8s}  '
+          f'{"bot_auc":8s}  {"firing_auc":10s}')
     for rank, t in enumerate(completed[:5], 1):
         print(
             f'  {rank:4d}  {t.number:5d}  {(t.value or 0):.4f}  '
-            f'{t.user_attrs.get("fab_val_mcc", float("nan")):.4f}      '
-            f'{t.user_attrs.get("bot_val_mcc", float("nan")):.4f}      '
-            f'{t.user_attrs.get("firing_val_mcc", float("nan")):.4f}'
+            f'{t.user_attrs.get("fab_val_auc", float("nan")):.4f}      '
+            f'{t.user_attrs.get("bot_val_auc", float("nan")):.4f}      '
+            f'{t.user_attrs.get("firing_val_auc", float("nan")):.4f}'
         )
     print('='*72)
 
@@ -852,14 +847,24 @@ def build_final_cmd_tsjepa(params: dict, gpu: int, profile: dict, final_epochs: 
 def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs: int) -> list[str]:
     """Build train_vr_encoder_pose_jepa.py command for the final model (eval_split_mode=test).
 
-    params may be raw Optuna best.params (contains ffn_mult / pred_ffn_mult rather
-    than pre-computed ffn_dim / pred_ffn_dim), so we recompute here.
+    params is raw Optuna best.params. If it contains 'model_shape', expand the
+    architecture preset; otherwise fall back to individual keys for legacy studies.
     """
     train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder_pose_jepa.py')
-    embed_dim    = params['embed_dim']
-    ffn_dim      = params.get('ffn_dim',      embed_dim * params.get('ffn_mult', 4))
-    pred_ffn_dim = params.get('pred_ffn_dim', embed_dim * params.get('pred_ffn_mult', 2))
-    fh_key       = params.get('future_horizon', 'medium')
+    if 'model_shape' in params:
+        shape        = _MODEL_SHAPES_POSEJEPA[params['model_shape']]
+        embed_dim    = shape['embed_dim']
+        ffn_dim      = shape['ffn_dim']
+        pred_ffn_dim = shape['pred_ffn_dim']
+        n_heads      = shape['n_heads']
+        n_layers     = shape['n_layers']
+    else:
+        embed_dim    = params['embed_dim']
+        ffn_dim      = params.get('ffn_dim',      embed_dim * params.get('ffn_mult', 4))
+        pred_ffn_dim = params.get('pred_ffn_dim', embed_dim * params.get('pred_ffn_mult', 2))
+        n_heads      = params['n_heads']
+        n_layers     = params['n_layers']
+    fh_key        = params.get('future_horizon', 'medium')
     fh_min, fh_max = _FUTURE_HORIZON_MAP[fh_key]
     stride_factor = params.get('stride_factor', 2)
     return [
@@ -875,15 +880,14 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--precision',          profile['precision'],
         '--warmup_epochs',      str(_warmup_epochs_posejepa(final_epochs)),
         '--val_fraction',       '0.15',
-        '--min_lr',             '1e-5',
+        '--min_lr',             '1e-6',
         '--kinematics',         'PVAJ',
-        '--samples_per_epoch',  '0',
+        '--samples_per_epoch',  str(params.get('samples_per_epoch', 0)),
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
-        '--eval_window_pool',   'stat9',
+        '--eval_window_pool',   params.get('eval_window_pool', 'stat9'),
         '--eval_session_pool',  'mean',
-        # '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
-        '--eval_metrics',       'portScore', 'bot_dist_mean_s3',
+        '--eval_metrics',       'portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3',
         '--stride_factor',      str(stride_factor),
         '--patch_size',         str(params['patch_size']),
         '--target_ratio',       str(params['target_ratio']),
@@ -901,8 +905,8 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--sampling_alpha',     str(params['sampling_alpha']),
         '--dropout',            str(params.get('dropout', 0.0)),
         '--embed_dim',          str(embed_dim),
-        '--n_heads',            str(params['n_heads']),
-        '--n_layers',           str(params['n_layers']),
+        '--n_heads',            str(n_heads),
+        '--n_layers',           str(n_layers),
         '--ffn_dim',            str(ffn_dim),
         '--max_len',            str(params['max_len']),
     ]
@@ -965,22 +969,26 @@ def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: 
     _stride_factor = params.get('stride_factor', 2)
     _p3_stride    = _max_len // _stride_factor
 
-    embed_script = str(_CHOROS_ROOT / 'pipeline' / 'embed_target_data.py')
+    embed_script  = str(_CHOROS_ROOT / 'pipeline' / 'embed_target_data.py')
+    train_obj     = objective  # save before loop shadows the name
+    p3_window_pool = (
+        params.get('eval_window_pool', 'stat9') if train_obj == 'posejepa' else 'mean'
+    )
     eval_targets = [
         (str(_DATA_ROOT / 'aligned' / 'target_FAB'),       'FAB', []),
         (str(_DATA_ROOT / 'aligned' / 'target_DEVCOM_s2'), 'D3',
          ['bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']),
     ]
-    for data_dir, objective, target_cols in eval_targets:
-        print(f'\n[Phase 3] {Path(data_dir).name}  objective={objective}')
+    for data_dir, embed_obj, target_cols in eval_targets:
+        print(f'\n[Phase 3] {Path(data_dir).name}  objective={embed_obj}')
         p3_cmd = [
             'conda', 'run', '-n', 'CHOROS',
             'python', embed_script,
             '--ckpt',         str(ckpt),
             '--data_dir',     data_dir,
-            '--objective',    objective,
+            '--objective',    embed_obj,
             '--stride',       str(_p3_stride),
-            '--window_pool',  'mean',
+            '--window_pool',  p3_window_pool,
             '--session_pool', 'mean',
             '--split_keys',   'train,val,test',
             '--train_split',  'train+val',
@@ -990,7 +998,7 @@ def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: 
             p3_cmd += ['--target_cols'] + target_cols
         rc, _ = _run_streaming(p3_cmd, env)
         if rc != 0:
-            print(f'\n[Phase 3] Failed for {objective} (exit code {rc})')
+            print(f'\n[Phase 3] Failed for {embed_obj} (exit code {rc})')
 
 
 # ---------------------------------------------------------------------------

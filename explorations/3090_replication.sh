@@ -2,6 +2,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate CHOROS
 # export CHOROS_DATA_ROOT=./srv/CHOROS/data0
 
+# replicate with a couple other setting to examine robustness
 CUDA_VISIBLE_DEVICES=0 python training/train_vr_encoder_pose_jepa.py --npy_dir /srv/CHOROS/data/kinematics/VR_npy_PVAJ --out_dir /srv/CHOROS_AUTO/outputs/checkpoints \
 --epochs 300 --embed_eval_interval 4 --batch_size 512 --num_workers 4 --precision bf16 --warmup_epochs 7 --val_fraction 0.15 --min_lr 1e-6 --kinematics PVAJ --samples_per_epoch 1024000 \
 --seed 42 --compile --eval_window_pool stat9 --eval_session_pool mean --eval_split_mode val --patch_size 4 --target_ratio 0.75 \

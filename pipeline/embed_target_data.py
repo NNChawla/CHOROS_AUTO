@@ -48,6 +48,7 @@ Output
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -422,10 +423,11 @@ def embed_windows(
 # ---------------------------------------------------------------------------
 
 def run_stem(ckpt_args: dict, stride: int, dataset: str,
-             window_pool: str, session_pool: str) -> str:
+             window_pool: str, session_pool: str, ckpt_stem: str | None = None) -> str:
     ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
     mask = ckpt_args.get('mask_ratio', ckpt_args.get('target_ratio', 'unk'))
     kin  = ckpt_args.get('kinematics', 'unk')
+    ckpt_part = f'_{ckpt_stem}' if ckpt_stem else ''
     return (
         f"{ts}"
         f"_{dataset}"
@@ -437,6 +439,7 @@ def run_stem(ckpt_args: dict, stride: int, dataset: str,
         f"_stride{stride}"
         f"_wp{window_pool}"
         f"_sp{session_pool}"
+        f"{ckpt_part}"
     )
 
 
@@ -568,6 +571,7 @@ def embed_all_preloaded(
     layer_avg_n:   int = 4,
     model:         nn.Module | None = None,
     ckpt:          dict | None = None,
+    cache_stem:    str | None = None,
 ) -> Path:
     """Like embed_all but accepts pre-loaded raw (un-normalized) arrays.
 
@@ -589,9 +593,39 @@ def embed_all_preloaded(
     window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 1)
     session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 3 if session_pool == 'mean_std_max' else 1)
 
-    emb_dir      = out_dir / run_stem(ckpt['args'], stride, dataset_name, window_pool, session_pool)
+    emb_name = cache_stem or run_stem(
+        ckpt['args'], stride, dataset_name, window_pool, session_pool, ckpt_path.stem
+    )
+    emb_dir      = out_dir / emb_name
     per_file_dir = emb_dir / 'per_file'
     per_file_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_stat = ckpt_path.stat()
+    cache_meta = {
+        'ckpt_path': str(ckpt_path),
+        'ckpt_mtime_ns': ckpt_stat.st_mtime_ns,
+        'ckpt_size': ckpt_stat.st_size,
+        'dataset_name': dataset_name,
+        'n_sequences': len(raw_sequences),
+        'stride': stride,
+        'window_pool': window_pool,
+        'session_pool': session_pool,
+        'max_len': max_len,
+        'embed_dim': embed_dim,
+        'session_embed_dim': session_embed_dim,
+    }
+    meta_path = emb_dir / 'embed_cache_meta.json'
+    csv_path = emb_dir / 'sequence_embeddings.csv'
+    npy_path = emb_dir / 'sequence_embeddings.npy'
+    if cache_stem and csv_path.exists() and npy_path.exists() and meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                old_meta = json.load(f)
+            if old_meta == cache_meta:
+                print(f'  CACHE HIT   : {emb_dir}')
+                return emb_dir
+        except Exception:
+            pass
 
     print(f'  Pool        : window={window_pool}  session={session_pool}')
     print(f'  Output dir  : {emb_dir}')
@@ -629,6 +663,8 @@ def embed_all_preloaded(
     df_out    = pd.DataFrame(seq_arr, columns=col_names)
     df_out.insert(0, 'filename', seq_names)
     df_out.to_csv(emb_dir / 'sequence_embeddings.csv', index=False)
+    with open(meta_path, 'w') as f:
+        json.dump(cache_meta, f, indent=2)
 
     print(f'  Sequences   : {seq_arr.shape}')
     print(f'OUT_DIR: {emb_dir}')
@@ -669,6 +705,7 @@ def embed_and_probe(args) -> list[Path]:
     probe_train_split  = getattr(args, 'train_split', None)
     probe_eval_split   = getattr(args, 'eval_split', None)
     probe_no_train_median = getattr(args, 'no_train_median', False)
+    probe_classification_only = getattr(args, 'classification_only', False)
 
     if (probe_train_split is None) != (probe_eval_split is None):
         raise ValueError('--train_split and --eval_split must be provided together')
@@ -755,6 +792,8 @@ def embed_and_probe(args) -> list[Path]:
                 cmd += ['--eval_split', probe_eval_split]
             if probe_no_train_median:
                 cmd += ['--no_train_median']
+            if probe_classification_only:
+                cmd += ['--classification-only']
             result = subprocess.run(cmd, capture_output=True, text=True)
             print(result.stdout)
             if result.returncode != 0:
@@ -828,6 +867,8 @@ def parse_args():
                         "Example: /path/to/DEVCOM_emb:DEVCOM,/path/to/other_FAB_emb:FAB2")
     p.add_argument('--no_train_median', action='store_true', default=False,
                    help='Use population median as threshold (default: train-split median).')
+    p.add_argument('--classification_only', action='store_true', default=False,
+                   help='Only run the median-split classifier; skip regression and quartile probes.')
     return p.parse_args()
 
 

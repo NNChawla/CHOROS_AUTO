@@ -10,6 +10,7 @@ C selection:
 """
 
 import re
+import itertools
 import warnings
 import argparse
 import os
@@ -20,7 +21,7 @@ from joblib import Parallel, delayed
 from sklearn.linear_model import Ridge, RidgeCV, LogisticRegression
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import LeaveOneOut, LeaveOneGroupOut, cross_val_score
+from sklearn.model_selection import LeaveOneOut, LeaveOneGroupOut, cross_val_score, cross_val_predict
 from sklearn.metrics import (r2_score, mean_absolute_error,
                              accuracy_score, balanced_accuracy_score,
                              roc_auc_score, classification_report,
@@ -77,8 +78,9 @@ OBJECTIVE_CFG = {
     },
 }
 
-alphas  = np.logspace(-2, 4, 50)
-Cs_grid = np.logspace(-3, 3, 20)
+alphas        = np.logspace(-2, 4, 50)
+Cs_grid       = np.logspace(-5, 5, 11)
+penalties_grid = ['l1', 'l2']
 
 
 def _score_alpha(alpha, X, y_raw, groups, cv):
@@ -95,15 +97,16 @@ def _select_alpha_logo(X, y_raw, groups):
     return alphas[int(np.argmax(scores))]
 
 
-def _make_classifier(C, classifier):
+def _make_classifier(C, classifier, penalty='l2'):
     if classifier == "svc":
-        return LinearSVC(C=C, max_iter=5000, class_weight="balanced",
-                         random_state=42, dual=True)
-    return LogisticRegression(C=C, max_iter=2000, class_weight="balanced",
-                              solver="lbfgs", random_state=42)
+        return LinearSVC(C=C, penalty=penalty, max_iter=5000, class_weight="balanced",
+                         random_state=42, dual=(penalty == 'l2'))
+    solver = 'liblinear' if penalty == 'l1' else 'lbfgs'
+    return LogisticRegression(C=C, penalty=penalty, max_iter=2000, class_weight="balanced",
+                              solver=solver, random_state=42)
 
-def _score_C(C, X, y_cls, groups, cv, classifier="svc"):
-    model = _make_classifier(C, classifier)
+def _score_C(C, penalty, X, y_cls, groups, cv, classifier="svc"):
+    model = _make_classifier(C, classifier, penalty)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         return cross_val_score(model, X, y_cls, cv=cv, groups=groups,
@@ -111,17 +114,19 @@ def _score_C(C, X, y_cls, groups, cv, classifier="svc"):
 
 def _select_C_logo(X, y_cls, groups, classifier="svc"):
     logo = LeaveOneGroupOut()
+    param_grid = list(itertools.product(Cs_grid, penalties_grid))
     scores = Parallel(n_jobs=-1)(
-        delayed(_score_C)(C, X, y_cls, groups, logo, classifier) for C in Cs_grid
+        delayed(_score_C)(C, pen, X, y_cls, groups, logo, classifier) for C, pen in param_grid
     )
-    return Cs_grid[int(np.argmax(scores))]
+    return param_grid[int(np.argmax(scores))]  # (C, penalty)
 
 def _select_C_loo(X, y_cls, classifier="svc"):
     loo = LeaveOneOut()
+    param_grid = list(itertools.product(Cs_grid, penalties_grid))
     scores = Parallel(n_jobs=-1)(
-        delayed(_score_C)(C, X, y_cls, None, loo, classifier) for C in Cs_grid
+        delayed(_score_C)(C, pen, X, y_cls, None, loo, classifier) for C, pen in param_grid
     )
-    return Cs_grid[int(np.argmax(scores))]
+    return param_grid[int(np.argmax(scores))]  # (C, penalty)
 
 
 def run_regression_split(
@@ -174,9 +179,11 @@ def run_classification_split(
     groups_train: np.ndarray | None,
     eval_split_name: str,
     classifier: str = "svc",
-) -> tuple[np.ndarray, np.ndarray | None, dict]:
+    fixed_C: float | None = None,
+    fixed_penalty: str | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, dict, float | None, str | None]:
     """
-    Fit linear classifier on train (C via LOGO or LOO), evaluate on eval.
+    Fit linear classifier on train (C and penalty via LOGO or LOO), evaluate on eval.
     Returns (y_pred, pos_scores_1d, metrics_dict).
     pos_scores_1d is decision_function (SVC) or predict_proba[:,1] (LogReg) for binary,
     or None for the skipped case.
@@ -190,17 +197,21 @@ def run_classification_split(
         print(f"\n── {label} [{eval_split_name}] SKIPPED (only {len(actual_train_classes)} class in train) ──")
         dummy = np.full(len(y_eval), actual_train_classes[0])
         return dummy, None, {'acc': float('nan'), 'bacc': float('nan'),
-                             'mcc': float('nan'), 'f1': float('nan'), 'auc': float('nan')}
+                             'mcc': float('nan'), 'f1': float('nan'), 'auc': float('nan')}, None, None
 
-    if groups_train is not None:
-        best_C   = _select_C_logo(X_train, y_train, groups_train, classifier)
+    if fixed_C is not None:
+        best_C       = fixed_C
+        best_penalty = fixed_penalty if fixed_penalty is not None else 'l2'
+        cv_label = "fixed"
+    elif groups_train is not None:
+        best_C, best_penalty = _select_C_logo(X_train, y_train, groups_train, classifier)
         cv_label = "LOGO"
     else:
-        best_C   = _select_C_loo(X_train, y_train, classifier)
+        best_C, best_penalty = _select_C_loo(X_train, y_train, classifier)
         cv_label = "LOO"
 
     clf_label = "LinearSVC" if classifier == "svc" else "LogReg"
-    model = _make_classifier(best_C, classifier)
+    model = _make_classifier(best_C, classifier, best_penalty)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         model.fit(X_train, y_train)
@@ -234,8 +245,9 @@ def run_classification_split(
             auc = float('nan')
         auc_str = f"  ROC-AUC (macro) : {auc:.4f}"
 
-    print(f"\n── {label} [{eval_split_name}] ({clf_label}, C via {cv_label} on train) ──────────")
+    print(f"\n── {label} [{eval_split_name}] ({clf_label}, C/penalty via {cv_label} on train) ──────────")
     print(f"  Best C          : {best_C:.4f}")
+    print(f"  Best penalty    : {best_penalty}")
     print(f"  Accuracy        : {acc:.4f}")
     print(f"  Balanced Acc.   : {bacc:.4f}")
     print(f"  MCC             : {mcc:.4f}")
@@ -246,7 +258,7 @@ def run_classification_split(
 
     # Return 1D positive-class score for output CSV
     pos_scores = scores if scores.ndim == 1 else scores[:, 1]
-    return y_pred, pos_scores, {'acc': acc, 'bacc': bacc, 'mcc': mcc, 'f1': f1, 'auc': auc}
+    return y_pred, pos_scores, {'acc': acc, 'bacc': bacc, 'mcc': mcc, 'f1': f1, 'auc': auc}, best_C, best_penalty
 
 
 def run_probe(
@@ -257,6 +269,9 @@ def run_probe(
     eval_split: str = "test",
     train_median: bool = False,
     classifier: str = "svc",
+    classification_only: bool = False,
+    fixed_C: float | None = None,
+    fixed_penalty: str | None = None,
 ) -> dict:
     emb_path = Path(emb_dir) if emb_dir else None
     if emb_path is None or not emb_path.is_absolute():
@@ -365,9 +380,14 @@ def run_probe(
             groups_train = None
             print(f"C/alpha selection: LOO on train")
 
-        y_pred_reg, reg_metrics = run_regression_split(
-            X_train, y_train_raw, X_eval, y_eval_raw, groups_train, eval_split)
-        results[target_display] = {**reg_metrics, 'n_samples': len(merged_eval)}
+        if classification_only:
+            y_pred_reg = np.full(len(y_eval_raw), np.nan, dtype=np.float32)
+            results[target_display] = {'n_samples': len(merged_eval)}
+            print("\n── Regression skipped (classification-only probe) ─────────────")
+        else:
+            y_pred_reg, reg_metrics = run_regression_split(
+                X_train, y_train_raw, X_eval, y_eval_raw, groups_train, eval_split)
+            results[target_display] = {**reg_metrics, 'n_samples': len(merged_eval)}
 
         if train_median:
             median = np.median(y_train_raw)
@@ -386,20 +406,59 @@ def run_probe(
                   f"train low={(y_train_med==0).sum()} high={(y_train_med==1).sum()}  "
                   f"eval low={(y_eval_med==0).sum()} high={(y_eval_med==1).sum()}")
 
-        pred_med, prob_med, med_metrics = run_classification_split(
+        pred_med, prob_med, med_metrics, med_C, med_penalty = run_classification_split(
             "Median-split (binary)", X_train, y_train_med,
             X_eval, y_eval_med, n_classes=2, groups_train=groups_train,
-            eval_split_name=eval_split, classifier=classifier)
+            eval_split_name=eval_split, classifier=classifier,
+            fixed_C=fixed_C, fixed_penalty=fixed_penalty)
+        _cv_clf = _make_classifier(med_C, classifier, med_penalty)
+        _cv_scheme = LeaveOneGroupOut() if groups_train is not None else LeaveOneOut()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            _y_train_cv = cross_val_predict(
+                _cv_clf, X_train, y_train_med,
+                cv=_cv_scheme, groups=groups_train)
+            try:
+                _score_method = 'decision_function' if classifier == 'svc' else 'predict_proba'
+                _scores_cv = cross_val_predict(
+                    _cv_clf, X_train, y_train_med,
+                    cv=_cv_scheme, groups=groups_train, method=_score_method)
+                if classifier != 'svc' and _scores_cv.ndim == 2:
+                    _scores_cv = _scores_cv[:, 1]
+                _auc_train = (roc_auc_score(y_train_med, _scores_cv)
+                              if len(np.unique(y_train_med)) == 2 else float('nan'))
+            except Exception:
+                _auc_train = float('nan')
+        _cv_label = "LOGO" if groups_train is not None else "LOO"
+        print(f"\n── Median-split (binary) [train] CV ({_cv_label}) ──────────")
+        train_med_metrics = {
+            'acc':  accuracy_score(y_train_med, _y_train_cv),
+            'bacc': balanced_accuracy_score(y_train_med, _y_train_cv),
+            'mcc':  matthews_corrcoef(y_train_med, _y_train_cv),
+            'f1':   f1_score(y_train_med, _y_train_cv, average='macro', zero_division=0),
+            'auc':  _auc_train,
+        }
+        print(f"  Balanced Acc.   : {train_med_metrics['bacc']:.4f}")
+        print(f"  Accuracy        : {train_med_metrics['acc']:.4f}")
+        print(f"  MCC             : {train_med_metrics['mcc']:.4f}")
+        print(f"  F1 (macro)      : {train_med_metrics['f1']:.4f}")
+        print(f"  ROC-AUC         : {train_med_metrics['auc']:.4f}")
 
-        q1 = np.percentile(y_train_raw, 25)
-        q3 = np.percentile(y_train_raw, 75)
-        y_train_qrt = np.where(y_train_raw <= q1, 0, np.where(y_train_raw <= q3, 1, 2))
-        y_eval_qrt  = np.where(y_eval_raw  <= q1, 0, np.where(y_eval_raw  <= q3, 1, 2))
-        print(f"\nQuartile (train): Q1≤{q1:.3f} / Q2-Q3 / Q4>{q3:.3f}")
-        pred_qrt, prob_qrt, qrt_metrics = run_classification_split(
-            "Quartile-split (3-class)", X_train, y_train_qrt,
-            X_eval, y_eval_qrt, n_classes=3, groups_train=groups_train,
-            eval_split_name=eval_split, classifier=classifier)
+        if classification_only:
+            y_eval_qrt = np.full(len(y_eval_raw), np.nan, dtype=np.float32)
+            pred_qrt = np.full(len(y_eval_raw), np.nan, dtype=np.float32)
+            print("\n── Quartile classification skipped (classification-only probe) ─────────────")
+        else:
+            q1 = np.percentile(y_train_raw, 25)
+            q3 = np.percentile(y_train_raw, 75)
+            y_train_qrt = np.where(y_train_raw <= q1, 0, np.where(y_train_raw <= q3, 1, 2))
+            y_eval_qrt  = np.where(y_eval_raw  <= q1, 0, np.where(y_eval_raw  <= q3, 1, 2))
+            print(f"\nQuartile (train): Q1≤{q1:.3f} / Q2-Q3 / Q4>{q3:.3f}")
+            pred_qrt, prob_qrt, qrt_metrics, _, _ = run_classification_split(
+                "Quartile-split (3-class)", X_train, y_train_qrt,
+                X_eval, y_eval_qrt, n_classes=3, groups_train=groups_train,
+                eval_split_name=eval_split, classifier=classifier,
+                fixed_C=fixed_C, fixed_penalty=fixed_penalty)
 
         m = med_metrics
         import math as _math
@@ -415,6 +474,17 @@ def run_probe(
                 f"MCC: {m['mcc']:.4f}  "
                 f"F1(macro): {m['f1']:.4f}  "
                 f"ROC-AUC: {m['auc']:.4f}",
+                flush=True,
+            )
+        tm = train_med_metrics
+        if not any(_math.isnan(v) for v in tm.values()):
+            print(
+                f"[Probe] objective={objective} target={tcol} split=train "
+                f"Balanced Acc.: {tm['bacc']:.4f}  "
+                f"Acc.: {tm['acc']:.4f}  "
+                f"MCC: {tm['mcc']:.4f}  "
+                f"F1(macro): {tm['f1']:.4f}  "
+                f"ROC-AUC: {tm['auc']:.4f}",
                 flush=True,
             )
 
@@ -461,9 +531,20 @@ if __name__ == '__main__':
     p.add_argument("--classifier", type=str, default="svc",
                    choices=["svc", "logreg"],
                    help="Classifier: svc=LinearSVC (default), logreg=LogisticRegression.")
+    p.add_argument("--classification-only", action="store_true",
+                   help="Only run the median-split classifier used by summary metrics.")
+    p.add_argument("--fixed-C", type=float, default=None,
+                   help="Use a fixed classifier C and skip C cross-validation.")
+    p.add_argument("--fixed-penalty", type=str, default=None,
+                   choices=["l1", "l2"],
+                   help="Use a fixed penalty and skip penalty cross-validation "
+                        "(only meaningful with --fixed-C; defaults to l2).")
     args = p.parse_args()
 
     run_probe(args.emb_dir, args.objective, args.target_col,
               train_split=args.train_split, eval_split=args.eval_split,
               train_median=not args.no_train_median,
-              classifier=args.classifier)
+              classifier=args.classifier,
+              classification_only=args.classification_only,
+              fixed_C=args.fixed_C,
+              fixed_penalty=args.fixed_penalty)

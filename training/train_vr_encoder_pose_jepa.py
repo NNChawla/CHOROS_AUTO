@@ -21,7 +21,7 @@ Checkpoint files
 ----------------
   checkpoint_latest.pt              — saved every epoch
   checkpoint_best.pt                — best pretraining val loss (or train loss)
-  checkpoint_best_probe_val.pt      — best aggregate val MCC from periodic eval
+  checkpoint_best_probe_val.pt      — best 3-eval smoothed aggregate val MCC from periodic eval
                                       (only updated when embed_eval_interval > 0)
   checkpoint_best_probe_<metric>_wp_<window_pool>_sp_<session_pool>.pt
                                     — best val MCC for each individual metric
@@ -201,6 +201,23 @@ class VRDataset(Dataset):
                 share = self.sampling_shares[ds]
                 print(f"  {ds:24s}  {ds_total_wins[ds]:>12,d}  "
                       f"{100*share:>6.2f}%  {share * self._n:>11,.0f}")
+            print()
+            print(f"  File-length distribution (frames) per sampled dataset:")
+            print(f"  {'Dataset':24s}  {'Files':>6s}  {'Mean':>8s}  "
+                  f"{'Q1':>8s}  {'Median':>8s}  {'Q3':>8s}")
+            print(f"  {'-'*72}")
+            _all_lens: list[int] = []
+            for ds in sorted(ds_names, key=lambda k: -self.sampling_shares[k]):
+                _lens = [self._file_n_rows[i] for i in groups[ds]]
+                _all_lens.extend(_lens)
+                _arr = np.array(_lens, dtype=np.float64)
+                _q1, _med, _q3 = np.percentile(_arr, [25, 50, 75])
+                print(f"  {ds:24s}  {len(_lens):>6,d}  {_arr.mean():>8,.1f}  "
+                      f"{_q1:>8,.1f}  {_med:>8,.1f}  {_q3:>8,.1f}")
+            _all_arr = np.array(_all_lens, dtype=np.float64)
+            _aq1, _amed, _aq3 = np.percentile(_all_arr, [25, 50, 75])
+            print(f"  {'ALL':24s}  {len(_all_lens):>6,d}  {_all_arr.mean():>8,.1f}  "
+                  f"{_aq1:>8,.1f}  {_amed:>8,.1f}  {_aq3:>8,.1f}")
             print(flush=True)
         else:
             print(f'Val pretraining set: {len(self.files):,} files  '
@@ -430,6 +447,10 @@ def run_stem(args) -> str:
         stem += "_cgrpsched"
     stem += f"_sa{args.sampling_alpha}"
     stem += f"_sf{args.stride_factor}"
+    if getattr(args, 'eval_window_pool', None):
+        stem += f"_ewp{args.eval_window_pool}"
+    if getattr(args, 'eval_session_pool', None):
+        stem += f"_esp{args.eval_session_pool}"
     return stem
 
 
@@ -594,21 +615,31 @@ def _active_metrics(args) -> frozenset:
     return frozenset(m) if m else _PROBE_TARGET_KEYS
 
 
-def _parse_probe_results(text: str, target_keys: frozenset) -> tuple[float | None, dict[str, float]]:
-    """Return (mean_val_mcc, per_target_mccs).
+def _parse_probe_results(
+    text: str, target_keys: frozenset,
+) -> tuple[float | None, dict[str, float], float | None, dict[str, float]]:
+    """Return (mean_val_mcc, per_val_mccs, mean_train_mcc, per_train_mccs).
 
-    mean_val_mcc is None if any requested target is missing; per_target_mccs
-    contains whatever targets were found.
+    mean_val/train_mcc is None if any requested target is missing.
     """
-    mccs: dict[str, float] = {}
+    val_mccs:   dict[str, float] = {}
+    train_mccs: dict[str, float] = {}
     for line in text.splitlines():
         m = _PROBE_SUMMARY_RE.search(line)
-        if m and m.group(3) == 'val':
-            target = m.group(2)
-            if target in target_keys:
-                mccs[target] = float(m.group(5))
-    avg = sum(mccs.values()) / len(mccs) if target_keys <= mccs.keys() else None
-    return avg, mccs
+        if not m:
+            continue
+        split  = m.group(3)
+        target = m.group(2)
+        if target not in target_keys:
+            continue
+        mcc = float(m.group(5))
+        if split == 'val':
+            val_mccs[target]   = mcc
+        elif split == 'train':
+            train_mccs[target] = mcc
+    val_avg   = sum(val_mccs.values())   / len(val_mccs)   if target_keys <= val_mccs.keys()   else None
+    train_avg = sum(train_mccs.values()) / len(train_mccs) if target_keys <= train_mccs.keys() else None
+    return val_avg, val_mccs, train_avg, train_mccs
 
 
 def _probe_ckpt_suffix(args) -> str:
@@ -628,10 +659,10 @@ def _periodic_eval(
     epoch:   int,
     args,
     use_best_ckpt: bool = False,
-) -> tuple[float | None, dict[str, float]]:
+) -> tuple[float | None, dict[str, float], float | None, dict[str, float]]:
     """
     Embed FAB and DEVCOM_s2 targets then run linear probes.
-    Returns (aggregate_val_mcc, per_target_mccs).
+    Returns (aggregate_val_mcc, per_val_mccs, aggregate_train_mcc, per_train_mccs).
     aggregate_val_mcc is None if any of the 3 required targets is missing.
     """
     ckpt_name = 'checkpoint_best.pt' if use_best_ckpt else 'checkpoint_latest.pt'
@@ -640,7 +671,7 @@ def _periodic_eval(
         ckpt = run_dir / 'checkpoint_latest.pt'
     if not ckpt.exists():
         print(f'[Eval] checkpoint not found — skipping epoch {epoch} eval')
-        return None, {}
+        return None, {}, None, {}
 
     embed_script = Path(__file__).parent.parent / 'pipeline' / 'embed_target_data.py'
 
@@ -657,7 +688,7 @@ def _periodic_eval(
             eval_targets.append((args.devcom_eval_dir, 'D3', cols))
     if not eval_targets:
         print(f'[Eval] no valid eval dirs — skipping epoch {epoch} eval')
-        return None, {}
+        return None, {}, None, {}
 
     print(f'\n{"="*72}')
     print(f'Periodic eval — epoch {epoch}  ckpt: {ckpt}')
@@ -687,7 +718,7 @@ def _periodic_eval(
             cmd += ['--window_pool', args.eval_window_pool]
         if getattr(args, 'eval_session_pool', None):
             cmd += ['--session_pool', args.eval_session_pool]
-        cmd += extra_embed + extra_probe
+        cmd += extra_embed + extra_probe + ['--classification_only']
         result = subprocess.run(cmd, capture_output=True, text=True)
         print(result.stdout)
         if result.returncode != 0:
@@ -893,8 +924,11 @@ def train(args):
     )
 
     # --------------------------------------------------------------- resume
-    best_jepa_loss       = float('inf')
-    best_probe_mcc       = float('-inf')
+    best_jepa_loss               = float('inf')
+    best_jepa_epoch              = 0
+    best_smoothed_probe_mcc      = float('-inf')
+    best_smoothed_probe_mcc_epoch = 0
+    probe_mcc_history: list[float] = []
     best_probe_metric_mccs: dict[str, float] = {k: float('-inf') for k in _active_metrics(args)}
     global_step          = 0
     start_epoch          = 1
@@ -905,9 +939,12 @@ def train(args):
         optimizer.load_state_dict(ckpt_r['optimizer_state'])
         scheduler.load_state_dict(ckpt_r['scheduler_state'])
         scaler.load_state_dict(ckpt_r['scaler_state'])
-        best_jepa_loss         = ckpt_r.get('best_loss', float('inf'))
-        best_probe_mcc         = ckpt_r.get('best_probe_mcc', float('-inf'))
-        best_probe_metric_mccs = ckpt_r.get(
+        best_jepa_loss                = ckpt_r.get('best_loss', float('inf'))
+        best_jepa_epoch               = ckpt_r.get('best_jepa_epoch', 0)
+        best_smoothed_probe_mcc       = ckpt_r.get('best_smoothed_probe_mcc', float('-inf'))
+        best_smoothed_probe_mcc_epoch = ckpt_r.get('best_smoothed_probe_mcc_epoch', 0)
+        probe_mcc_history             = ckpt_r.get('probe_mcc_history', [])
+        best_probe_metric_mccs        = ckpt_r.get(
             'best_probe_metric_mccs', {k: float('-inf') for k in _active_metrics(args)}
         )
         global_step    = ckpt_r.get('global_step', 0)
@@ -1012,8 +1049,11 @@ def train(args):
         ckpt = {
             'epoch':                   epoch,
             'best_loss':               best_jepa_loss,
-            'best_probe_mcc':          best_probe_mcc,
-            'best_probe_metric_mccs':  best_probe_metric_mccs,
+            'best_jepa_epoch':         best_jepa_epoch,
+            'best_smoothed_probe_mcc':       best_smoothed_probe_mcc,
+            'best_smoothed_probe_mcc_epoch': best_smoothed_probe_mcc_epoch,
+            'probe_mcc_history':             probe_mcc_history,
+            'best_probe_metric_mccs':        best_probe_metric_mccs,
             'global_step':             global_step,
             'model_state':     pose_jepa_model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
@@ -1055,7 +1095,8 @@ def train(args):
         torch.save(ckpt, run_dir / 'checkpoint_latest.pt')
 
         if checkpoint_score < best_jepa_loss:
-            best_jepa_loss = checkpoint_score
+            best_jepa_loss  = checkpoint_score
+            best_jepa_epoch = epoch
             torch.save(ckpt, run_dir / 'checkpoint_best.pt')
             metric_label = 'val' if val_loader is not None else 'loss'
             print(f'  -> new best checkpoint saved ({metric_label}={best_jepa_loss:.6f})')
@@ -1064,17 +1105,26 @@ def train(args):
         if args.embed_eval_interval > 0 and epoch % args.embed_eval_interval == 0:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            probe_mcc, per_metric_mccs = _periodic_eval(
+            probe_mcc, per_metric_mccs, train_probe_mcc, _ = _periodic_eval(
                 run_dir, epoch, args,
                 use_best_ckpt=getattr(args, 'eval_use_best_ckpt', False),
             )
             pool_suffix = _probe_ckpt_suffix(args)
-            if probe_mcc is not None and probe_mcc > best_probe_mcc:
-                best_probe_mcc = probe_mcc
-                ckpt['best_probe_mcc'] = best_probe_mcc
-                torch.save(ckpt, run_dir / f'checkpoint_best_probe_val{pool_suffix}.pt')
-                print(f'  -> new best probe checkpoint saved '
-                      f'(val_mcc={best_probe_mcc:.4f})')
+            if probe_mcc is not None:
+                probe_mcc_history.append(probe_mcc)
+                probe_mcc_history = probe_mcc_history[-3:]
+                smoothed_mcc = float(np.mean(probe_mcc_history))
+                train_mcc_str = f'  probe_train_mcc={train_probe_mcc:.4f}' if train_probe_mcc is not None else ''
+                print(f'  probe_val_mcc={probe_mcc:.4f}{train_mcc_str}  smoothed({len(probe_mcc_history)})={smoothed_mcc:.4f}')
+                if smoothed_mcc > best_smoothed_probe_mcc:
+                    best_smoothed_probe_mcc       = smoothed_mcc
+                    best_smoothed_probe_mcc_epoch = epoch
+                    ckpt['best_smoothed_probe_mcc']       = best_smoothed_probe_mcc
+                    ckpt['best_smoothed_probe_mcc_epoch'] = best_smoothed_probe_mcc_epoch
+                    ckpt['probe_mcc_history']             = probe_mcc_history
+                    torch.save(ckpt, run_dir / f'checkpoint_best_probe_val{pool_suffix}.pt')
+                    print(f'  -> new best probe checkpoint saved '
+                          f'(smoothed_mcc={best_smoothed_probe_mcc:.4f})')
             for target_key, mcc in per_metric_mccs.items():
                 if mcc > best_probe_metric_mccs.get(target_key, float('-inf')):
                     best_probe_metric_mccs[target_key] = mcc
@@ -1086,9 +1136,9 @@ def train(args):
                           f'(mcc={mcc:.4f}) -> {fname}')
 
     _metric_label = 'val' if val_loader is not None else 'loss'
-    print(f'\nTraining complete. Best {_metric_label}: {best_jepa_loss:.6f}')
-    if best_probe_mcc > float('-inf'):
-        print(f'Best probe val MCC: {best_probe_mcc:.4f}')
+    print(f'\nTraining complete. Best {_metric_label}: {best_jepa_loss:.6f} (epoch {best_jepa_epoch})')
+    if best_smoothed_probe_mcc > float('-inf'):
+        print(f'Best smoothed probe val MCC: {best_smoothed_probe_mcc:.4f} (epoch {best_smoothed_probe_mcc_epoch})')
     print(f'Run dir  : {run_dir}')
     print(f'Finished : {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
