@@ -1,6 +1,7 @@
+import os
 from huggingface_hub import snapshot_download
 
-hf_token = "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"
+hf_token = os.environ["HF_TOKEN"]
 
 # Replace with your specific repo ID and desired local path
 repo_id = "nnchawla/CHOROS"

@@ -1234,7 +1234,7 @@ def parse_args():
     p.add_argument('--devcom_eval_dir', type=str,
                    default=str(_DATA_ROOT / 'aligned' / 'target_DEVCOM_s2'))
     p.add_argument('--eval_window_pool',  type=str, default=None,
-                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'])
+                   choices=['mean', 'mean_std', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'])
     p.add_argument('--eval_session_pool', type=str, default=None,
                    choices=['mean', 'stat4'])
     p.add_argument('--eval_split_mode',   type=str, default=None,

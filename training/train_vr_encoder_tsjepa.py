@@ -979,7 +979,7 @@ def parse_args():
                    default=str(_DATA_ROOT / 'aligned' / 'target_DEVCOM_s2'),
                    help='DEVCOM_s2 target directory for periodic eval embeddings')
     p.add_argument('--eval_window_pool', type=str, default=None,
-                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last'],
+                   choices=['mean', 'mean_std', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last'],
                    help='When set, periodic eval runs only this window pool instead of all four')
     p.add_argument('--eval_session_pool', type=str, default=None,
                    choices=['mean', 'stat4'],

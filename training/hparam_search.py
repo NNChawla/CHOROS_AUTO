@@ -4,9 +4,9 @@ Bayesian hyperparameter search for VR motion encoder (MAE, TS-JEPA, or Pose-JEPA
 Uses Optuna with TPE sampler.  Each trial runs the relevant training script as
 an isolated subprocess for 10 epochs with --eval_window_pool mean
 --eval_session_pool mean (single pool for speed), then parses epoch-10 output
-to extract arithmetic mean ROC-AUC across 3 downstream objectives.
+to extract harmonic mean ROC-AUC across 3 downstream objectives.
 
-Aggregate metric: arithmetic mean of val ROC-AUC across
+Aggregate metric: harmonic mean of val ROC-AUC across
   FAB portScore / DEVCOM bot_dist_mean_s3 / firing_accuracy_AOBJ_s3
   (flag_incidents_s3 excluded: severe val-set class imbalance, 13/4 split)
 
@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from statistics import harmonic_mean
 
 import optuna
 import subprocess
@@ -69,8 +70,8 @@ _N_HEADS_CHOICES = [4, 8]
 # Architecture presets for Pose-JEPA model_shape hyperparameter.
 _MODEL_SHAPES_POSEJEPA: dict[str, dict] = {
     'small':  {'embed_dim': 128, 'ffn_dim': 512,  'pred_ffn_dim': 256,  'n_heads': 4, 'n_layers': 4},
-    'medium': {'embed_dim': 258, 'ffn_dim': 1032, 'pred_ffn_dim': 516,  'n_heads': 6, 'n_layers': 6},
-    'large':  {'embed_dim': 512, 'ffn_dim': 2048, 'pred_ffn_dim': 1024, 'n_heads': 8, 'n_layers': 8},
+    # 'medium': {'embed_dim': 258, 'ffn_dim': 1032, 'pred_ffn_dim': 516,  'n_heads': 6, 'n_layers': 6},
+    # 'large':  {'embed_dim': 512, 'ffn_dim': 2048, 'pred_ffn_dim': 1024, 'n_heads': 8, 'n_layers': 8},
 }
 
 # Translates feature_group_mask choice to --feature_group_mask CLI args
@@ -159,27 +160,27 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
 
     return {
         'model_shape':      model_shape,
-        'patch_size':       trial.suggest_categorical('patch_size', [4, 6, 8]),
-        'target_ratio':     trial.suggest_categorical('target_ratio', [0.3, 0.45, 0.6, 0.75]),
+        'patch_size':       trial.suggest_int('patch_size', 4, 8, step=4),
+        'target_ratio':     trial.suggest_float('target_ratio', 0.5, 0.75, step=0.05),
         'target_mode':      target_mode,
-        'n_target_blocks':  trial.suggest_categorical('n_target_blocks', [2]),
+        'n_target_blocks':  trial.suggest_int('n_target_blocks', 2, 4),
         'future_min_gap':   future_min_gap,
         'future_horizon':   future_horizon,
-        'ema_start':        trial.suggest_categorical('ema_start', [0.993, 0.995, 0.997, 0.999]),
-        'pred_layers':      trial.suggest_categorical('pred_layers', [2]),
+        'ema_start':        trial.suggest_float('ema_start', 0.99, 0.9996),
+        'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
         'pred_ffn_dim':     shape['pred_ffn_dim'],
         'latent_loss':        trial.suggest_categorical('latent_loss', ['smooth_l1']),
-        'lr':                 trial.suggest_categorical('lr', [1e-5, 5e-5, 1e-4, 5e-4]),
-        'sampling_alpha':     trial.suggest_categorical('sampling_alpha', [0.25, 0.50, 0.75]),
-        'dropout':            trial.suggest_categorical('dropout', [0.0, 0.05, 0.1, 0.2]),
+        'lr':                 trial.suggest_float('lr', 1e-5, 1e-3, log=True),
+        'sampling_alpha':     trial.suggest_categorical('sampling_alpha', [0.5]),
+        'dropout':            trial.suggest_float('dropout', 0.0, 0.15, step=0.05),
         'embed_dim':          shape['embed_dim'],
         'n_heads':            shape['n_heads'],
         'n_layers':           shape['n_layers'],
         'ffn_dim':            shape['ffn_dim'],
         # max_len must be divisible by patch_size (8)
-        'max_len':            trial.suggest_categorical('max_len', [64, 96, 128, 256]),
-        'samples_per_epoch':  trial.suggest_categorical('samples_per_epoch', [256000, 512000, 1024000]),
-        'eval_window_pool':   trial.suggest_categorical('eval_window_pool', ['mean', 'mean_std_max', 'stat9']),
+        'max_len':            trial.suggest_categorical('max_len', [64, 128]),
+        'samples_per_epoch':  trial.suggest_categorical('samples_per_epoch', [256000]),
+        'eval_window_pool':   trial.suggest_categorical('eval_window_pool', ['mean_std']),
     }
 
 
@@ -319,12 +320,12 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '50',
-        '--embed_eval_interval','5',
+        '--epochs',             '100',
+        '--embed_eval_interval','10',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
-        '--warmup_epochs',      str(_warmup_epochs_posejepa(50)),
+        '--warmup_epochs',      str(_warmup_epochs_posejepa(100)),
         '--val_fraction',       '0.15',
         '--min_lr',             '1e-6',
         '--kinematics',         'PVAJ',
@@ -423,7 +424,7 @@ def parse_eval_output(text: str) -> dict[str, dict]:
 def aggregate_metric(metrics: dict[str, dict]) -> float:
     keys = ['portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']
     aucs = [metrics[k]['auc'] for k in keys]
-    return sum(aucs) / len(aucs)
+    return harmonic_mean(aucs)
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +730,7 @@ def _print_best_trial(study: optuna.Study) -> None:
     for k, v in sorted(best.params.items()):
         print(f'    {k:25s} = {v}')
 
-    print(f'\nTop 5 by aggregate score (arithmetic mean val AUC):')
+    print(f'\nTop 5 by aggregate score (harmonic mean val AUC):')
     print(f'  {"Rank":4s}  {"Trial":5s}  {"score":6s}  {"fab_auc":8s}  '
           f'{"bot_auc":8s}  {"firing_auc":10s}')
     for rank, t in enumerate(completed[:5], 1):
@@ -873,7 +874,7 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
         '--epochs',             str(final_epochs),
-        '--embed_eval_interval','5',
+        '--embed_eval_interval','10',
         '--eval_split_mode',    'test',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),

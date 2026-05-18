@@ -308,6 +308,12 @@ def _apply_window_pool(
         max_e  = tok_m.max(dim=1).values
         return torch.cat([mean_e, std_e, max_e], dim=-1)
 
+    if strategy == 'mean_std':
+        mean_e = (token_hidden * mask_f).sum(1) / n_valid
+        diff   = (token_hidden - mean_e.unsqueeze(1)) * mask_f
+        std_e  = ((diff ** 2).sum(1) / n_valid).sqrt()
+        return torch.cat([mean_e, std_e], dim=-1)
+
     if strategy == 'stat9':
         inv_mask = ~valid_mask.unsqueeze(-1)
         mean_e   = (token_hidden * mask_f).sum(1) / n_valid
@@ -477,7 +483,7 @@ def embed_all(
     feature_cols = build_feature_cols(ckpt['args'].get('kinematics', 'P'))
     dataset      = data_dir.name
 
-    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 1)
+    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 2 if window_pool == 'mean_std' else 1)
     session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 3 if session_pool == 'mean_std_max' else 1)
 
     emb_dir      = out_dir / run_stem(ckpt['args'], stride, dataset, window_pool, session_pool)
@@ -590,7 +596,7 @@ def embed_all_preloaded(
     norm_mean    = ckpt['norm_mean'].astype(np.float32)
     norm_std     = ckpt['norm_std'].astype(np.float32)
 
-    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 1)
+    window_embed_dim  = embed_dim * (9 if window_pool == 'stat9' else 3 if window_pool == 'mean_std_max' else 2 if window_pool == 'mean_std' else 1)
     session_embed_dim = window_embed_dim * (4 if session_pool == 'stat4' else 3 if session_pool == 'mean_std_max' else 1)
 
     emb_name = cache_stem or run_stem(
@@ -846,7 +852,7 @@ def parse_args():
                    help='Columns to probe (space-separated). '
                         'Defaults to the standard columns for the objective.')
     p.add_argument('--window_pool', default=None,
-                   choices=['mean', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'],
+                   choices=['mean', 'mean_std', 'mean_std_max', 'layer_avg', 'cls', 'mean_all', 'last', 'stat9'],
                    help='Run only this window pooling strategy instead of all four configs.')
     p.add_argument('--session_pool', default=None,
                    choices=['mean', 'stat4', 'mean_std_max'],
