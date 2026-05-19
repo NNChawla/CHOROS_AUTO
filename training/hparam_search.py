@@ -237,15 +237,15 @@ def _warmup_epochs_posejepa(epochs: int) -> int:
     return round(epochs * 0.1)
 
 
-def build_cmd(params: dict, gpu: int, profile: dict) -> list[str]:
+def build_cmd(params: dict, gpu: int, profile: dict, epochs: int = 10, eval_interval: int = 10) -> list[str]:
     train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder.py')
     cmd = [
         'conda', 'run', '-n', 'CHOROS',
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '10',
-        '--embed_eval_interval','10',
+        '--epochs',             str(epochs),
+        '--embed_eval_interval',str(eval_interval),
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
@@ -277,15 +277,15 @@ def build_cmd(params: dict, gpu: int, profile: dict) -> list[str]:
     return cmd
 
 
-def build_cmd_tsjepa(params: dict, gpu: int, profile: dict) -> list[str]:
+def build_cmd_tsjepa(params: dict, gpu: int, profile: dict, epochs: int = 10, eval_interval: int = 10) -> list[str]:
     train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder_tsjepa.py')
     cmd = [
         'conda', 'run', '-n', 'CHOROS',
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '10',
-        '--embed_eval_interval','10',
+        '--epochs',             str(epochs),
+        '--embed_eval_interval',str(eval_interval),
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
@@ -320,7 +320,7 @@ def build_cmd_tsjepa(params: dict, gpu: int, profile: dict) -> list[str]:
     return cmd
 
 
-def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
+def build_cmd_posejepa(params: dict, gpu: int, profile: dict, epochs: int = 100, eval_interval: int = 20) -> list[str]:
     train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder_pose_jepa.py')
     fh_min, fh_max = _FUTURE_HORIZON_MAP[params['future_horizon']]
     return [
@@ -328,12 +328,12 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         'python', train_script,
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
-        '--epochs',             '100',
-        '--embed_eval_interval','20',
+        '--epochs',             str(epochs),
+        '--embed_eval_interval',str(eval_interval),
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
-        '--warmup_epochs',      str(_warmup_epochs_posejepa(100)),
+        '--warmup_epochs',      str(_warmup_epochs_posejepa(epochs)),
         '--val_fraction',       '0.15',
         '--min_lr',             str(params['min_lr']),
         '--kinematics',         'P', #PVAJ
@@ -496,18 +496,26 @@ def _progress_callback(study: optuna.Study, trial: optuna.Trial) -> None:
 # Optuna objective
 # ---------------------------------------------------------------------------
 
+_DEFAULT_EPOCHS: dict[str, int] = {'mae': 10, 'tsjepa': 10, 'posejepa': 100}
+_DEFAULT_EVAL_INTERVAL: dict[str, int] = {'mae': 10, 'tsjepa': 10, 'posejepa': 20}
+
+
 def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'mae',
-              trial_timeout: int = 1500) -> float:
+              trial_timeout: int = 1500, trial_epochs: int | None = None,
+              eval_interval: int | None = None) -> float:
+    epochs   = trial_epochs  if trial_epochs  is not None else _DEFAULT_EPOCHS[objective]
+    interval = eval_interval if eval_interval is not None else _DEFAULT_EVAL_INTERVAL[objective]
+
     if objective == 'tsjepa':
         params = sample_hyperparams_tsjepa(trial)
-        cmd    = build_cmd_tsjepa(params, gpu, profile)
+        cmd    = build_cmd_tsjepa(params, gpu, profile, epochs, interval)
     elif objective == 'posejepa':
         params = sample_hyperparams_posejepa(trial)
-        cmd    = build_cmd_posejepa(params, gpu, profile)
+        cmd    = build_cmd_posejepa(params, gpu, profile, epochs, interval)
     else:
         params = sample_hyperparams(trial)
-        cmd    = build_cmd(params, gpu, profile)
-    env     = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu)}
+        cmd    = build_cmd(params, gpu, profile, epochs, interval)
+    env = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu)}
 
     peak_mb    = [0]
     stop_event = threading.Event()
@@ -516,30 +524,78 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
     )
     monitor.start()
 
-    t0 = time.time()
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=trial_timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as e:
-        stop_event.set()
-        elapsed = time.time() - t0
-        _log_trial_failure(trial.number, params, f'timeout ({trial_timeout}s)', elapsed)
-        raise optuna.exceptions.TrialPruned()
-    finally:
-        stop_event.set()
+    t0   = time.time()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+
+    stdout_lines:  list[str] = []
+    stderr_lines:  list[str] = []
+    current_round: dict      = {}
+    step_counter = [0]
+    pruned_flag  = [False]
+
+    def _read_stdout() -> None:
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            m = _PROBE_SUMMARY_RE.search(line)
+            if m and m.group(3) == 'val':
+                target = m.group(2)
+                if target in _TARGET_KEYS:
+                    current_round[target] = {
+                        'bacc': float(m.group(4)),
+                        'mcc':  float(m.group(5)),
+                        'f1':   float(m.group(6)),
+                        'auc':  float(m.group(7)),
+                    }
+                    if _TARGET_KEYS <= current_round.keys():
+                        score = aggregate_metric(current_round)
+                        trial.report(score, step_counter[0])
+                        step_counter[0] += 1
+                        current_round.clear()
+                        if trial.should_prune():
+                            print(
+                                f'[T {trial.number:03d}] pruned at step {step_counter[0] - 1} '
+                                f'(score={score:.4f})',
+                                flush=True,
+                            )
+                            proc.kill()
+                            pruned_flag[0] = True
+                            return
+
+    def _read_stderr() -> None:
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    reader     = threading.Thread(target=_read_stdout, daemon=True)
+    err_reader = threading.Thread(target=_read_stderr, daemon=True)
+    reader.start()
+    err_reader.start()
+
+    reader.join(timeout=trial_timeout)
+    timed_out = reader.is_alive()
+    if timed_out:
+        proc.kill()
+    err_reader.join(timeout=5)
+    proc.wait()
+    stop_event.set()
 
     elapsed      = time.time() - t0
     peak_vram_gb = peak_mb[0] / 1024.0
 
-    if result.returncode != 0:
-        reason = (result.stderr or result.stdout)[-500:]
+    if timed_out:
+        _log_trial_failure(trial.number, params, f'timeout ({trial_timeout}s)', elapsed)
+        raise optuna.exceptions.TrialPruned()
+
+    if pruned_flag[0]:
+        raise optuna.exceptions.TrialPruned()
+
+    if proc.returncode != 0:
+        reason = (''.join(stderr_lines) or ''.join(stdout_lines))[-500:]
         _log_trial_failure(trial.number, params, reason, elapsed)
         raise optuna.exceptions.TrialPruned()
 
-    stdout  = result.stdout
+    stdout  = ''.join(stdout_lines)
     metrics = parse_eval_output(stdout)
 
     missing = _TARGET_KEYS - metrics.keys()
@@ -556,11 +612,11 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
     for short, key in [('fab',    'portScore'),
                        ('bot',    'bot_dist_mean_s3'),
                        ('firing', 'firing_accuracy_AOBJ_s3')]:
-        m = metrics[key]
-        trial.set_user_attr(f'{short}_val_bacc', m['bacc'])
-        trial.set_user_attr(f'{short}_val_mcc',  m['mcc'])
-        trial.set_user_attr(f'{short}_val_f1',   m['f1'])
-        trial.set_user_attr(f'{short}_val_auc',  m['auc'])
+        md = metrics[key]
+        trial.set_user_attr(f'{short}_val_bacc', md['bacc'])
+        trial.set_user_attr(f'{short}_val_mcc',  md['mcc'])
+        trial.set_user_attr(f'{short}_val_f1',   md['f1'])
+        trial.set_user_attr(f'{short}_val_auc',  md['auc'])
     trial.set_user_attr('elapsed_s',    round(elapsed))
     trial.set_user_attr('peak_vram_gb', round(peak_vram_gb, 2))
 
@@ -655,7 +711,8 @@ def _log_trial_summary_posejepa(
 # ---------------------------------------------------------------------------
 
 def create_study(study_name: str, worker_offset: int = 0,
-                 storage_url: str | None = None) -> optuna.Study:
+                 storage_url: str | None = None,
+                 pruner: optuna.pruners.BasePruner | None = None) -> optuna.Study:
     if storage_url is None:
         db_path = _CHOROS_ROOT / 'outputs' / 'hparam_search' / 'optuna.db'
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,6 +727,7 @@ def create_study(study_name: str, worker_offset: int = 0,
         study_name=study_name,
         storage=storage_url,
         sampler=sampler,
+        pruner=pruner,
         direction='maximize',
         load_if_exists=True,
     )
@@ -1051,10 +1109,21 @@ def parse_args():
                    help='Enable torch.compile in trial subprocesses (overrides GPU profile)')
     p.add_argument('--no_compile',     dest='compile', action='store_false',
                    help='Disable torch.compile in trial subprocesses (overrides GPU profile)')
+    p.add_argument('--trial_epochs',   type=int, default=None,
+                   help='Epochs per trial subprocess. Defaults: mae/tsjepa=10, posejepa=100.')
+    p.add_argument('--eval_interval',  type=int, default=None,
+                   help='embed_eval_interval per trial subprocess. Defaults: mae/tsjepa=10, posejepa=20.')
     p.add_argument('--trial_timeout',  type=int, default=1500,
                    help='Per-trial subprocess timeout in seconds (default: 1500). '
                         'Increase for slower GPUs running long-epoch objectives '
                         'e.g. --trial_timeout 7200 for posejepa on an RTX 4070.')
+    p.add_argument('--no_early_stopping', action='store_true',
+                   help='Disable Optuna MedianPruner early stopping. By default, trials '
+                        'whose intermediate scores fall below the median of prior trials '
+                        'are pruned (most impactful for posejepa with 5 eval checkpoints).')
+    p.add_argument('--pruner_startup', type=int, default=5,
+                   help='Number of completed trials before the pruner starts pruning '
+                        '(default: 5). Passed as n_startup_trials to MedianPruner.')
     return p.parse_args()
 
 
@@ -1068,18 +1137,30 @@ def main():
     if args.compile is not None:
         profile['compile'] = args.compile
     print_gpu_profile(profile)
-    study   = create_study(args.study_name, args.worker_offset, args.storage)
+
+    pruner = None
+    if not args.no_early_stopping:
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=args.pruner_startup,
+            n_warmup_steps=1,
+            interval_steps=1,
+        )
+
+    study = create_study(args.study_name, args.worker_offset, args.storage, pruner=pruner)
 
     existing = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     print(f'Study: {args.study_name}')
     print(f'Objective: {args.objective}')
+    print(f'Early stopping: {"disabled" if args.no_early_stopping else f"MedianPruner (startup={args.pruner_startup}, warmup=1)"}')
     print(f'Existing completed trials: {existing}')
     print(f'GPU: {args.gpu}   Trials to run: {args.n_trials}')
 
     import functools
     objective_fn = functools.partial(run_trial, gpu=args.gpu, profile=profile,
                                      objective=args.objective,
-                                     trial_timeout=args.trial_timeout)
+                                     trial_timeout=args.trial_timeout,
+                                     trial_epochs=args.trial_epochs,
+                                     eval_interval=args.eval_interval)
 
     t_start = time.time()
     try:
