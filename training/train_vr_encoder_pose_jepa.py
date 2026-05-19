@@ -14,6 +14,7 @@ Key differences vs. train_vr_encoder_tsjepa.py
   • --latent_loss      smooth_l1 | cosine (default: smooth_l1).
   • --embed_pool       cls | mean | mean_std | last (default: mean).
   • --context_device_drop  Devices zeroed in context ONLY (cross-device task).
+  • --context_device_drop_schedule  Stochastic context-only device masking.
   • --context_group_mask   Kinematic groups zeroed in context ONLY.
   • --diag_interval    Log collapse diagnostics every N epochs (default: 1).
 
@@ -427,6 +428,7 @@ def run_stem(args) -> str:
         f"_e{args.epochs}"
         f"_bs{args.batch_size}"
         f"_lr{args.lr}"
+        f"_wd{args.weight_decay}"
         f"_dim{args.embed_dim}"
         f"_l{args.n_layers}"
         f"_ml{args.max_len}"
@@ -441,6 +443,8 @@ def run_stem(args) -> str:
     )
     if args.context_device_drop:
         stem += "_cdev" + "".join(d[0] for d in sorted(args.context_device_drop))
+    if getattr(args, 'context_device_drop_schedule', None):
+        stem += "_cdevsched"
     if args.context_group_mask:
         stem += "_cgrp" + "".join(sorted(g.upper() for g in args.context_group_mask))
     if getattr(args, 'context_group_mask_schedule', None):
@@ -484,6 +488,7 @@ def make_run_dir(base_dir: Path, args) -> Path:
     print(f"  batch_size     : {args.batch_size}")
     print(f"  lr             : {args.lr}")
     print(f"  min_lr         : {args.min_lr}")
+    print(f"  weight_decay   : {args.weight_decay}")
     print(f"  warmup_epochs  : {args.warmup_epochs}")
     print(f"  max_len        : {args.max_len}")
     print(f"  stride_factor  : {args.stride_factor}")
@@ -494,6 +499,7 @@ def make_run_dir(base_dir: Path, args) -> Path:
     print(f"  future_horizon : {args.future_horizon_min}–{args.future_horizon_max}")
     print(f"  latent_loss    : {args.latent_loss}")
     print(f"  ctx_dev_drop   : {args.context_device_drop or '(none)'}")
+    print(f"  ctx_dev_sched  : {args.context_device_drop_schedule or '(none)'}")
     print(f"  ctx_grp_mask   : {args.context_group_mask or '(none)'}")
     print(f"  ctx_grp_sched  : {args.context_group_mask_schedule or '(none)'}")
     print(f"  ema_start      : {args.ema_start}")
@@ -517,10 +523,12 @@ def make_run_dir(base_dir: Path, args) -> Path:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _compute_val_loss(model, val_loader, device, amp_dtype, args, ctx_mask_cols) -> float:
+def _compute_val_loss(
+    model, val_loader, device, amp_dtype, args,
+    ctx_mask_cols, ctx_dev_cols,
+) -> float:
     model.eval()
     total, n = 0.0, 0
-    ctx_dev  = _context_device_col_indices(args)
     for x, lengths in val_loader:
         x       = x.to(device, non_blocking=True)
         lengths = lengths.to(device, non_blocking=True)
@@ -534,7 +542,7 @@ def _compute_val_loss(model, val_loader, device, amp_dtype, args, ctx_mask_cols)
                 future_min_gap=args.future_min_gap,
                 future_horizon=(args.future_horizon_min, args.future_horizon_max),
                 feat_mask_cols=ctx_mask_cols,
-                context_device_cols=ctx_dev,
+                context_device_cols=ctx_dev_cols,
                 latent_loss=args.latent_loss,
             )
         total += loss.item()
@@ -551,6 +559,55 @@ def _context_device_col_indices(args) -> list[int] | None:
     from masking import device_col_indices as _dci
     cols = _dci(args.kinematics, list(args.context_device_drop))
     return sorted(set(cols)) if cols else None
+
+
+def _split_device_schedule_devices(dev_str: str) -> list[str]:
+    """Parse device names from a schedule entry body.
+
+    Preferred format is comma-separated, e.g. "head,left". Single-letter
+    aliases are accepted for compact schedules.
+    """
+    if not dev_str:
+        return []
+    aliases = {'h': 'head', 'l': 'left', 'r': 'right'}
+    devices = []
+    for raw in dev_str.replace('+', ',').split(','):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        devices.append(aliases.get(token, token))
+    return devices
+
+
+def _parse_device_drop_schedule(
+    schedule: list[str], kinematics: str,
+) -> list[tuple[float, list[int] | None]]:
+    """Parse --context_device_drop_schedule entries into (probability, col_indices).
+
+    Entry format: 'weight:DEVICES' where DEVICES is a comma-separated list of
+    head/left/right (empty = no device masking). Weights are normalised to sum to 1.
+
+    Example: ['70:', '10:head', '10:left', '10:right']
+    """
+    parsed = []
+    for entry in schedule:
+        if ':' not in entry:
+            raise ValueError(
+                f"Invalid schedule entry '{entry}'. Expected 'weight:DEVICES', "
+                f"e.g. '70:' (no mask) or '10:head,left'."
+            )
+        w_str, dev_str = entry.split(':', 1)
+        weight = float(w_str)
+        if weight < 0:
+            raise ValueError(f"Negative weight in schedule entry '{entry}'.")
+        devices = _split_device_schedule_devices(dev_str)
+        cols = sorted(set(device_col_indices(kinematics, devices))) if devices else None
+        parsed.append((weight, cols))
+
+    total = sum(w for w, _ in parsed)
+    if total <= 0:
+        raise ValueError("--context_device_drop_schedule weights must sum to a positive number.")
+    return [(w / total, cols) for w, cols in parsed]
 
 
 def _parse_group_mask_schedule(
@@ -787,6 +844,15 @@ def train(args):
             "--context_group_mask and --context_group_mask_schedule are mutually exclusive."
         )
 
+    cdd_schedule = (
+        _parse_device_drop_schedule(args.context_device_drop_schedule, args.kinematics)
+        if args.context_device_drop_schedule else None
+    )
+    if cdd_schedule and args.context_device_drop:
+        raise ValueError(
+            "--context_device_drop and --context_device_drop_schedule are mutually exclusive."
+        )
+
     ctx_dev_cols = _context_device_col_indices(args)
 
     run_dir = make_run_dir(out_dir, args)
@@ -915,7 +981,9 @@ def train(args):
     scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler)
     print(f'AMP dtype: {amp_dtype}')
 
-    optimizer    = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+    optimizer    = torch.optim.AdamW(
+        trainable_params, lr=args.lr, weight_decay=args.weight_decay
+    )
     total_steps  = len(loader) * args.epochs
     warmup_steps = len(loader) * args.warmup_epochs
     min_lr_ratio = args.min_lr / args.lr
@@ -980,6 +1048,13 @@ def train(args):
                 )[0]
                 if cgm_schedule else feat_mask_cols
             )
+            batch_device_mask = (
+                random.choices(
+                    [cols for _, cols in cdd_schedule],
+                    weights=[w for w, _ in cdd_schedule],
+                )[0]
+                if cdd_schedule else ctx_dev_cols
+            )
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=device.type == 'cuda'):
@@ -991,7 +1066,7 @@ def train(args):
                     future_min_gap=args.future_min_gap,
                     future_horizon=future_horizon,
                     feat_mask_cols=batch_feat_mask,
-                    context_device_cols=ctx_dev_cols,
+                    context_device_cols=batch_device_mask,
                     latent_loss=args.latent_loss,
                 )
 
@@ -1028,6 +1103,7 @@ def train(args):
             val_loss = _compute_val_loss(
                 model, val_loader, device, amp_dtype, args,
                 None if cgm_schedule else feat_mask_cols,
+                None if cdd_schedule else ctx_dev_cols,
             )
             print(f'Epoch {epoch:3d}/{args.epochs}  '
                   f'train={avg_loss:.6f}  val={val_loss:.6f}  '
@@ -1082,11 +1158,14 @@ def train(args):
                 'future_horizon':      future_horizon,
                 'latent_loss':         args.latent_loss,
                 'context_device_drop':          args.context_device_drop,
+                'context_device_drop_schedule': args.context_device_drop_schedule,
                 'context_group_mask':           args.context_group_mask,
                 'context_group_mask_schedule':  args.context_group_mask_schedule,
                 'feat_mask_cols':               feat_mask_cols,
+                'cdd_schedule':                 cdd_schedule,
                 'cgm_schedule':                 cgm_schedule,
                 'ctx_dev_cols':        ctx_dev_cols,
+                'weight_decay':        args.weight_decay,
                 'sampling_alpha':      args.sampling_alpha,
                 'samples_per_epoch':   dataset._n,
                 'dataset_sampling_shares': dataset.sampling_shares,
@@ -1169,6 +1248,7 @@ def parse_args():
     p.add_argument('--batch_size',    type=int,   default=_profile['batch_size'])
     p.add_argument('--lr',            type=float, default=1e-3)
     p.add_argument('--min_lr',        type=float, default=1e-6)
+    p.add_argument('--weight_decay',  type=float, default=1e-4)
     p.add_argument('--warmup_epochs', type=int,   default=2)
     p.add_argument('--max_len',       type=int,   default=MAX_LEN)
     p.add_argument('--stride_factor', type=int,   default=2)
@@ -1214,6 +1294,12 @@ def parse_args():
     p.add_argument('--context_device_drop', nargs='*', metavar='DEVICE',
                    help='Zero device columns in context ONLY (cross-device prediction). '
                         'Valid: head left right.')
+    p.add_argument('--context_device_drop_schedule', nargs='*', metavar='ENTRY',
+                   help='Stochastic context device masking: sample a device mask per batch. '
+                        'Each entry: "weight:DEVICES" where DEVICES is comma-separated '
+                        'head/left/right (empty = no mask). Weights are normalised. '
+                        'Mutually exclusive with --context_device_drop. '
+                        'Example: "70:" "10:head" "10:left" "10:right"')
     p.add_argument('--context_group_mask', nargs='*', metavar='GROUP',
                    help='Zero kinematic group columns in context ONLY. Valid: P V A J.')
     p.add_argument('--context_group_mask_schedule', nargs='*', metavar='ENTRY',

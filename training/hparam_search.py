@@ -35,6 +35,11 @@ Usage
   conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 40 \\
       --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \\
       --worker_offset 1 --skip_final
+
+  # Slower GPU (e.g. RTX 4070) — increase trial timeout so 100-epoch trials finish:
+  conda run -n CHOROS python training/hparam_search.py --gpu 0 --n_trials 40 \\
+      --storage "postgresql://optuna:choroshps@app.arcadea.us/optuna_choros" \\
+      --worker_offset 4070 --skip_final --objective posejepa --trial_timeout 7200
 """
 
 import argparse
@@ -69,8 +74,9 @@ _N_HEADS_CHOICES = [4, 8]
 
 # Architecture presets for Pose-JEPA model_shape hyperparameter.
 _MODEL_SHAPES_POSEJEPA: dict[str, dict] = {
-    'small':  {'embed_dim': 128, 'ffn_dim': 512,  'pred_ffn_dim': 256,  'n_heads': 4, 'n_layers': 4},
+    # 'small':  {'embed_dim': 128, 'ffn_dim': 512,  'pred_ffn_dim': 256,  'n_heads': 4, 'n_layers': 4},
     # 'medium': {'embed_dim': 258, 'ffn_dim': 1032, 'pred_ffn_dim': 516,  'n_heads': 6, 'n_layers': 6},
+    'medium_v2': {'embed_dim': 256, 'ffn_dim': 1024, 'pred_ffn_dim': 512,  'n_heads': 4, 'n_layers': 6},
     # 'large':  {'embed_dim': 512, 'ffn_dim': 2048, 'pred_ffn_dim': 1024, 'n_heads': 8, 'n_layers': 8},
 }
 
@@ -161,18 +167,26 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
     return {
         'model_shape':      model_shape,
         'patch_size':       trial.suggest_int('patch_size', 4, 8, step=4),
-        'target_ratio':     trial.suggest_float('target_ratio', 0.5, 0.75, step=0.05),
+        # 'target_ratio':     trial.suggest_float('target_ratio', 0.25, 0.75, step=0.25),
+        'target_ratio':     trial.suggest_categorical('target_ratio', [0.75]),
         'target_mode':      target_mode,
-        'n_target_blocks':  trial.suggest_int('n_target_blocks', 2, 4),
+        # 'n_target_blocks':  trial.suggest_int('n_target_blocks', 2, 4),
+        'n_target_blocks':  trial.suggest_categorical('n_target_blocks', [2]),
         'future_min_gap':   future_min_gap,
         'future_horizon':   future_horizon,
-        'ema_start':        trial.suggest_float('ema_start', 0.99, 0.9996),
-        'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
+        'ema_start':        trial.suggest_categorical('ema_start', [0.992, 0.994, 0.996, 0.998]),
+        # 'pred_layers':      trial.suggest_int('pred_layers', 1, 3),
+        'pred_layers':      trial.suggest_categorical('pred_layers', [1]),
         'pred_ffn_dim':     shape['pred_ffn_dim'],
-        'latent_loss':        trial.suggest_categorical('latent_loss', ['smooth_l1']),
-        'lr':                 trial.suggest_float('lr', 1e-5, 1e-3, log=True),
+        # 'latent_loss':        trial.suggest_categorical('latent_loss', ['smooth_l1']),
+        'latent_loss':        trial.suggest_categorical('latent_loss', ['cosine']),
+        # 'lr':                 trial.suggest_float('lr', 1e-5, 1e-3, log=True),
+        'lr':                 trial.suggest_categorical('lr', [1e-3, 1e-4, 1e-5]),
+        'min_lr':             trial.suggest_categorical('min_lr', [1e-7, 1e-6, 1e-5]),
+        'weight_decay':       trial.suggest_categorical('weight_decay', [1e-1, 1e-2, 1e-3, 1e-4]),
         'sampling_alpha':     trial.suggest_categorical('sampling_alpha', [0.5]),
-        'dropout':            trial.suggest_float('dropout', 0.0, 0.15, step=0.05),
+        # 'dropout':            trial.suggest_float('dropout', 0.0, 0.15, step=0.05),
+        'dropout':            trial.suggest_categorical('dropout', [0.0, 0.05, 0.1]),
         'embed_dim':          shape['embed_dim'],
         'n_heads':            shape['n_heads'],
         'n_layers':           shape['n_layers'],
@@ -197,8 +211,8 @@ def _profile_for_gpu(gpu_index: int) -> dict:
         precision = 'bf16' if props.major >= 8 else 'fp16'
         backend   = _detect_attn_backend(props.major)
         return {
-            'batch_size':   512 if high else 512,
-            'num_workers':  6 if high else 4,
+            'batch_size':   256 if high else 256,
+            'num_workers':  4 if high else 4,
             'compile':      False,  # always off for hparam trials
             'precision':    precision,
             'attn_backend': backend,
@@ -220,11 +234,7 @@ _FUTURE_HORIZON_MAP: dict[str, tuple[int, int]] = {
 
 
 def _warmup_epochs_posejepa(epochs: int) -> int:
-    if epochs <= 10:
-        return 1
-    if epochs <= 50:
-        return 2
-    return 5
+    return round(epochs * 0.1)
 
 
 def build_cmd(params: dict, gpu: int, profile: dict) -> list[str]:
@@ -260,7 +270,6 @@ def build_cmd(params: dict, gpu: int, profile: dict) -> list[str]:
         '--n_layers',           str(params['n_layers']),
         '--ffn_dim',            str(params['ffn_dim']),
         '--max_len',            str(params['max_len']),
-        '--eval_use_best_ckpt',
     ]
     fgm_args = _FEATURE_MASK_ARGS[params['feature_group_mask']]
     if fgm_args:
@@ -304,7 +313,6 @@ def build_cmd_tsjepa(params: dict, gpu: int, profile: dict) -> list[str]:
         '--n_layers',           str(params['n_layers']),
         '--ffn_dim',            str(params['ffn_dim']),
         '--max_len',            str(params['max_len']),
-        '--eval_use_best_ckpt',
     ]
     fgm_args = _FEATURE_MASK_ARGS[params['feature_group_mask']]
     if fgm_args:
@@ -321,14 +329,14 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         '--npy_dir',            str(_DATA_ROOT / 'kinematics' / 'VR_npy_PVAJ'),
         '--out_dir',            str(_CHOROS_ROOT / 'outputs' / 'checkpoints'),
         '--epochs',             '100',
-        '--embed_eval_interval','10',
+        '--embed_eval_interval','20',
         '--batch_size',         str(profile['batch_size']),
         '--num_workers',        str(profile['num_workers']),
         '--precision',          profile['precision'],
         '--warmup_epochs',      str(_warmup_epochs_posejepa(100)),
         '--val_fraction',       '0.15',
-        '--min_lr',             '1e-6',
-        '--kinematics',         'PVAJ',
+        '--min_lr',             str(params['min_lr']),
+        '--kinematics',         'P', #PVAJ
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
         '--eval_session_pool',  'mean',
@@ -350,6 +358,7 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         '--latent_loss',        params['latent_loss'],
         '--embed_pool',         'mean',
         '--lr',                 str(params['lr']),
+        '--weight_decay',       str(params['weight_decay']),
         '--sampling_alpha',     str(params['sampling_alpha']),
         '--dropout',            str(params['dropout']),
         '--embed_dim',          str(params['embed_dim']),
@@ -357,7 +366,6 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict) -> list[str]:
         '--n_layers',           str(params['n_layers']),
         '--ffn_dim',            str(params['ffn_dim']),
         '--max_len',            str(params['max_len']),
-        '--eval_use_best_ckpt',
     ]
 
 
@@ -488,7 +496,8 @@ def _progress_callback(study: optuna.Study, trial: optuna.Trial) -> None:
 # Optuna objective
 # ---------------------------------------------------------------------------
 
-def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'mae') -> float:
+def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'mae',
+              trial_timeout: int = 1500) -> float:
     if objective == 'tsjepa':
         params = sample_hyperparams_tsjepa(trial)
         cmd    = build_cmd_tsjepa(params, gpu, profile)
@@ -511,13 +520,13 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=1500,  # 25-minute hard cap per trial
+            timeout=trial_timeout,
             env=env,
         )
     except subprocess.TimeoutExpired as e:
         stop_event.set()
         elapsed = time.time() - t0
-        _log_trial_failure(trial.number, params, 'timeout (1200s)', elapsed)
+        _log_trial_failure(trial.number, params, f'timeout ({trial_timeout}s)', elapsed)
         raise optuna.exceptions.TrialPruned()
     finally:
         stop_event.set()
@@ -628,6 +637,8 @@ def _log_trial_summary_posejepa(
         f"shape={params['model_shape']} "
         f"loss={params['latent_loss']} "
         f"lr={params['lr']:.2e} "
+        f"minlr={params['min_lr']:.1e} "
+        f"wd={params['weight_decay']:.1e} "
         f"ml={params['max_len']} "
         f"spe={params['samples_per_epoch']} "
         f"wp={params['eval_window_pool']} "
@@ -881,7 +892,7 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--precision',          profile['precision'],
         '--warmup_epochs',      str(_warmup_epochs_posejepa(final_epochs)),
         '--val_fraction',       '0.15',
-        '--min_lr',             '1e-6',
+        '--min_lr',             str(params.get('min_lr', 1e-6)),
         '--kinematics',         'PVAJ',
         '--samples_per_epoch',  str(params.get('samples_per_epoch', 0)),
         '--seed',               str(_FIXED_SEED),
@@ -903,6 +914,7 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--latent_loss',        params.get('latent_loss', 'smooth_l1'),
         '--embed_pool',         'mean',
         '--lr',                 str(params['lr']),
+        '--weight_decay',       str(params.get('weight_decay', 1e-4)),
         '--sampling_alpha',     str(params['sampling_alpha']),
         '--dropout',            str(params.get('dropout', 0.0)),
         '--embed_dim',          str(embed_dim),
@@ -1039,6 +1051,10 @@ def parse_args():
                    help='Enable torch.compile in trial subprocesses (overrides GPU profile)')
     p.add_argument('--no_compile',     dest='compile', action='store_false',
                    help='Disable torch.compile in trial subprocesses (overrides GPU profile)')
+    p.add_argument('--trial_timeout',  type=int, default=1500,
+                   help='Per-trial subprocess timeout in seconds (default: 1500). '
+                        'Increase for slower GPUs running long-epoch objectives '
+                        'e.g. --trial_timeout 7200 for posejepa on an RTX 4070.')
     return p.parse_args()
 
 
@@ -1062,7 +1078,8 @@ def main():
 
     import functools
     objective_fn = functools.partial(run_trial, gpu=args.gpu, profile=profile,
-                                     objective=args.objective)
+                                     objective=args.objective,
+                                     trial_timeout=args.trial_timeout)
 
     t_start = time.time()
     try:
