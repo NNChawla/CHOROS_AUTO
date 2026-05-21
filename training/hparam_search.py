@@ -2,13 +2,22 @@
 Bayesian hyperparameter search for VR motion encoder (MAE, TS-JEPA, or Pose-JEPA).
 
 Uses Optuna with TPE sampler.  Each trial runs the relevant training script as
-an isolated subprocess for 10 epochs with --eval_window_pool mean
---eval_session_pool mean (single pool for speed), then parses epoch-10 output
-to extract harmonic mean ROC-AUC across 3 downstream objectives.
+an isolated subprocess, periodically embeds target datasets, then parses probe
+output to extract downstream probe metrics across 3 downstream objectives.
 
-Aggregate metric: harmonic mean of val ROC-AUC across
+Aggregate metric: harmonic mean of per-target val probe scores across
   FAB portScore / DEVCOM bot_dist_mean_s3 / firing_accuracy_AOBJ_s3
   (flag_incidents_s3 excluded: severe val-set class imbalance, 13/4 split)
+
+By default, each per-target probe score is 0.5 * AUROC + 0.5 * rescaled MCC,
+where rescaled MCC = (MCC + 1) / 2.
+The cross-target aggregate blends harmonic mean with the weakest target:
+0.75 * harmonic_mean(target_scores) + 0.25 * min(target_scores).
+
+Trial selection defaults to a stability-aware score over recent probe evals:
+mean(last K aggregate probe scores) - volatility_penalty * std(last K)
++ trend_weight * (final - first).  Use --score_mode last to reproduce the
+old final-checkpoint-only trajectory handling.
 
 
 Usage
@@ -43,6 +52,7 @@ Usage
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -53,6 +63,7 @@ from statistics import harmonic_mean
 
 import optuna
 import subprocess
+import numpy as np
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -180,10 +191,11 @@ def sample_hyperparams_posejepa(trial: optuna.Trial) -> dict:
         'pred_ffn_dim':     shape['pred_ffn_dim'],
         # 'latent_loss':        trial.suggest_categorical('latent_loss', ['smooth_l1']),
         'latent_loss':        trial.suggest_categorical('latent_loss', ['cosine']),
-        # 'lr':                 trial.suggest_float('lr', 1e-5, 1e-3, log=True),
-        'lr':                 trial.suggest_categorical('lr', [1e-3, 1e-4, 1e-5]),
+        # Use new Optuna names for continuous versions to avoid distribution
+        # conflicts when a new run accidentally reuses an older categorical study.
+        'lr':                 trial.suggest_float('lr_cont', 1e-5, 1e-3, log=True),
         'min_lr':             trial.suggest_categorical('min_lr', [1e-7, 1e-6, 1e-5]),
-        'weight_decay':       trial.suggest_categorical('weight_decay', [1e-1, 1e-2, 1e-3, 1e-4]),
+        'weight_decay':       trial.suggest_float('weight_decay_cont', 1e-4, 1e-1, log=True),
         'sampling_alpha':     trial.suggest_categorical('sampling_alpha', [0.5]),
         # 'dropout':            trial.suggest_float('dropout', 0.0, 0.15, step=0.05),
         'dropout':            trial.suggest_categorical('dropout', [0.0, 0.05, 0.1]),
@@ -235,6 +247,15 @@ _FUTURE_HORIZON_MAP: dict[str, tuple[int, int]] = {
 
 def _warmup_epochs_posejepa(epochs: int) -> int:
     return round(epochs * 0.1)
+
+
+def _param_alias(params: dict, primary: str, alias: str, default=None):
+    """Read a parameter that may have a new Optuna name in newer studies."""
+    if primary in params:
+        return params[primary]
+    if alias in params:
+        return params[alias]
+    return default
 
 
 def build_cmd(params: dict, gpu: int, profile: dict, epochs: int = 10, eval_interval: int = 10) -> list[str]:
@@ -320,7 +341,8 @@ def build_cmd_tsjepa(params: dict, gpu: int, profile: dict, epochs: int = 10, ev
     return cmd
 
 
-def build_cmd_posejepa(params: dict, gpu: int, profile: dict, epochs: int = 100, eval_interval: int = 20) -> list[str]:
+def build_cmd_posejepa(params: dict, gpu: int, profile: dict, epochs: int = 100,
+                       eval_interval: int = 20, kinematics: str = 'P') -> list[str]:
     train_script = str(_CHOROS_ROOT / 'training' / 'train_vr_encoder_pose_jepa.py')
     fh_min, fh_max = _FUTURE_HORIZON_MAP[params['future_horizon']]
     return [
@@ -336,7 +358,7 @@ def build_cmd_posejepa(params: dict, gpu: int, profile: dict, epochs: int = 100,
         '--warmup_epochs',      str(_warmup_epochs_posejepa(epochs)),
         '--val_fraction',       '0.15',
         '--min_lr',             str(params['min_lr']),
-        '--kinematics',         'P', #PVAJ
+        '--kinematics',         kinematics,
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
         '--eval_session_pool',  'mean',
@@ -429,10 +451,79 @@ def parse_eval_output(text: str) -> dict[str, dict]:
     return results
 
 
-def aggregate_metric(metrics: dict[str, dict]) -> float:
+def aggregate_metric(
+    metrics: dict[str, dict],
+    auc_weight: float = 0.5,
+    mcc_weight: float = 0.5,
+    weakest_target_weight: float = 0.25,
+) -> float:
     keys = ['portScore', 'bot_dist_mean_s3', 'firing_accuracy_AOBJ_s3']
-    aucs = [metrics[k]['auc'] for k in keys]
-    return harmonic_mean(aucs)
+    weight_sum = auc_weight + mcc_weight
+    if weight_sum <= 0:
+        raise ValueError('auc_weight + mcc_weight must be positive')
+    if not 0.0 <= weakest_target_weight <= 1.0:
+        raise ValueError('weakest_target_weight must be in [0, 1]')
+    task_scores = []
+    for k in keys:
+        auc = metrics[k]['auc']
+        mcc_rescaled = (metrics[k]['mcc'] + 1.0) / 2.0
+        task_scores.append(
+            (auc_weight * auc + mcc_weight * mcc_rescaled) / weight_sum
+        )
+    hmean = harmonic_mean(task_scores)
+    weakest = min(task_scores)
+    return (1.0 - weakest_target_weight) * hmean + weakest_target_weight * weakest
+
+
+def _canonical_params(params: dict) -> str:
+    """Stable representation for exact duplicate-trial checks."""
+    return json.dumps(params, sort_keys=True, separators=(',', ':'), default=str)
+
+
+def _is_duplicate_trial(trial: optuna.Trial) -> bool:
+    current = _canonical_params(trial.params)
+    for other in trial.study.get_trials(deepcopy=False):
+        if other.number == trial.number:
+            continue
+        if other.state not in (
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.RUNNING,
+            optuna.trial.TrialState.WAITING,
+        ):
+            continue
+        if _canonical_params(other.params) == current:
+            trial.set_user_attr('duplicate_of', other.number)
+            return True
+    return False
+
+
+def aggregate_score_history(
+    scores: list[float],
+    mode: str = 'stable_tail',
+    tail_k: int = 3,
+    volatility_penalty: float = 0.5,
+    trend_weight: float = 0.1,
+) -> float:
+    """
+    Convert per-eval aggregate probe scores into the Optuna trial value.
+
+    The default stable_tail mode rewards sustained recent performance rather
+    than a single lucky final checkpoint:
+      mean(last K scores) - penalty * std(last K) + trend_weight * (last - first)
+    """
+    if not scores:
+        return float('nan')
+    if mode == 'last':
+        return scores[-1]
+    tail = scores[-max(1, tail_k):]
+    tail_mean = float(sum(tail) / len(tail))
+    if mode == 'mean_tail':
+        return tail_mean
+    if mode != 'stable_tail':
+        raise ValueError(f'unknown score history mode: {mode}')
+    tail_std = float(np.std(tail)) if len(tail) > 1 else 0.0
+    trend = float(scores[-1] - scores[0]) if len(scores) > 1 else 0.0
+    return tail_mean - volatility_penalty * tail_std + trend_weight * trend
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +593,12 @@ _DEFAULT_EVAL_INTERVAL: dict[str, int] = {'mae': 10, 'tsjepa': 10, 'posejepa': 2
 
 def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'mae',
               trial_timeout: int = 1500, trial_epochs: int | None = None,
-              eval_interval: int | None = None) -> float:
+              eval_interval: int | None = None, kinematics: str = 'P',
+              auc_weight: float = 0.5, mcc_weight: float = 0.5,
+              weakest_target_weight: float = 0.25,
+              score_mode: str = 'stable_tail', score_tail_k: int = 3,
+              volatility_penalty: float = 0.5,
+              trend_weight: float = 0.1) -> float:
     epochs   = trial_epochs  if trial_epochs  is not None else _DEFAULT_EPOCHS[objective]
     interval = eval_interval if eval_interval is not None else _DEFAULT_EVAL_INTERVAL[objective]
 
@@ -511,10 +607,15 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
         cmd    = build_cmd_tsjepa(params, gpu, profile, epochs, interval)
     elif objective == 'posejepa':
         params = sample_hyperparams_posejepa(trial)
-        cmd    = build_cmd_posejepa(params, gpu, profile, epochs, interval)
+        cmd    = build_cmd_posejepa(params, gpu, profile, epochs, interval, kinematics)
     else:
         params = sample_hyperparams(trial)
         cmd    = build_cmd(params, gpu, profile, epochs, interval)
+    if _is_duplicate_trial(trial):
+        dup = trial.user_attrs.get('duplicate_of')
+        print(f'[T {trial.number:03d}] duplicate of trial {dup} — pruning before training',
+              flush=True)
+        raise optuna.exceptions.TrialPruned()
     env = {**os.environ, 'CUDA_VISIBLE_DEVICES': str(gpu)}
 
     peak_mb    = [0]
@@ -532,6 +633,8 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
     stdout_lines:  list[str] = []
     stderr_lines:  list[str] = []
     current_round: dict      = {}
+    score_history: list[float] = []
+    metrics_history: list[dict[str, dict]] = []
     step_counter = [0]
     pruned_flag  = [False]
 
@@ -549,14 +652,29 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
                         'auc':  float(m.group(7)),
                     }
                     if _TARGET_KEYS <= current_round.keys():
-                        score = aggregate_metric(current_round)
-                        trial.report(score, step_counter[0])
+                        round_metrics = {k: dict(v) for k, v in current_round.items()}
+                        score = aggregate_metric(
+                            round_metrics,
+                            auc_weight=auc_weight,
+                            mcc_weight=mcc_weight,
+                            weakest_target_weight=weakest_target_weight,
+                        )
+                        score_history.append(score)
+                        metrics_history.append(round_metrics)
+                        reported_score = aggregate_score_history(
+                            score_history,
+                            mode=score_mode,
+                            tail_k=score_tail_k,
+                            volatility_penalty=volatility_penalty,
+                            trend_weight=trend_weight,
+                        )
+                        trial.report(reported_score, step_counter[0])
                         step_counter[0] += 1
                         current_round.clear()
                         if trial.should_prune():
                             print(
                                 f'[T {trial.number:03d}] pruned at step {step_counter[0] - 1} '
-                                f'(score={score:.4f})',
+                                f'(score={reported_score:.4f}, instant={score:.4f})',
                                 flush=True,
                             )
                             proc.kill()
@@ -596,7 +714,7 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
         raise optuna.exceptions.TrialPruned()
 
     stdout  = ''.join(stdout_lines)
-    metrics = parse_eval_output(stdout)
+    metrics = metrics_history[-1] if metrics_history else parse_eval_output(stdout)
 
     missing = _TARGET_KEYS - metrics.keys()
     if missing:
@@ -607,7 +725,22 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
         )
         raise optuna.exceptions.TrialPruned()
 
-    score = aggregate_metric(metrics)
+    if not score_history:
+        score_history = [aggregate_metric(
+            metrics,
+            auc_weight=auc_weight,
+            mcc_weight=mcc_weight,
+            weakest_target_weight=weakest_target_weight,
+        )]
+    score = aggregate_score_history(
+        score_history,
+        mode=score_mode,
+        tail_k=score_tail_k,
+        volatility_penalty=volatility_penalty,
+        trend_weight=trend_weight,
+    )
+    instant_final_score = score_history[-1]
+    tail = score_history[-max(1, score_tail_k):]
 
     for short, key in [('fab',    'portScore'),
                        ('bot',    'bot_dist_mean_s3'),
@@ -617,6 +750,15 @@ def run_trial(trial: optuna.Trial, gpu: int, profile: dict, objective: str = 'ma
         trial.set_user_attr(f'{short}_val_mcc',  md['mcc'])
         trial.set_user_attr(f'{short}_val_f1',   md['f1'])
         trial.set_user_attr(f'{short}_val_auc',  md['auc'])
+    trial.set_user_attr('score_mode', score_mode)
+    trial.set_user_attr('auc_weight', auc_weight)
+    trial.set_user_attr('mcc_weight', mcc_weight)
+    trial.set_user_attr('weakest_target_weight', weakest_target_weight)
+    trial.set_user_attr('score_history', [round(s, 6) for s in score_history])
+    trial.set_user_attr('final_instant_score', round(instant_final_score, 6))
+    trial.set_user_attr('tail_mean_score', round(float(sum(tail) / len(tail)), 6))
+    trial.set_user_attr('tail_std_score', round(float(np.std(tail)) if len(tail) > 1 else 0.0, 6))
+    trial.set_user_attr('score_trend', round(float(score_history[-1] - score_history[0]) if len(score_history) > 1 else 0.0, 6))
     trial.set_user_attr('elapsed_s',    round(elapsed))
     trial.set_user_attr('peak_vram_gb', round(peak_vram_gb, 2))
 
@@ -712,17 +854,23 @@ def _log_trial_summary_posejepa(
 
 def create_study(study_name: str, worker_offset: int = 0,
                  storage_url: str | None = None,
-                 pruner: optuna.pruners.BasePruner | None = None) -> optuna.Study:
+                 pruner: optuna.pruners.BasePruner | None = None,
+                 sampler_startup: int = 40,
+                 n_ei_candidates: int = 64,
+                 multivariate_tpe: bool = True) -> optuna.Study:
     if storage_url is None:
         db_path = _CHOROS_ROOT / 'outputs' / 'hparam_search' / 'optuna.db'
         db_path.parent.mkdir(parents=True, exist_ok=True)
         storage_url = f'sqlite:///{db_path}'
 
-    sampler = optuna.samplers.TPESampler(
-        n_startup_trials=10,
-        n_ei_candidates=24,
-        seed=42 + worker_offset,
-    )
+    sampler_kwargs = {
+        'n_startup_trials': sampler_startup,
+        'n_ei_candidates': n_ei_candidates,
+        'seed': 42 + worker_offset,
+    }
+    if multivariate_tpe:
+        sampler_kwargs.update({'multivariate': True, 'group': True})
+    sampler = optuna.samplers.TPESampler(**sampler_kwargs)
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_url,
@@ -752,6 +900,11 @@ def write_tsv_results(study: optuna.Study, out_path: Path) -> None:
         vram = t.user_attrs.get('peak_vram_gb', 'N/A')
         desc = (
             f"TPE trial {t.number}, aggregate={agg:.4f}, "
+            f"score_mode={t.user_attrs.get('score_mode', 'unknown')}, "
+            f"auc_weight={t.user_attrs.get('auc_weight', 'unknown')}, "
+            f"mcc_weight={t.user_attrs.get('mcc_weight', 'unknown')}, "
+            f"weakest_target_weight={t.user_attrs.get('weakest_target_weight', 'unknown')}, "
+            f"score_history={t.user_attrs.get('score_history', [])}, "
             + ', '.join(f'{k}={v}' for k, v in sorted(t.params.items()))
         )
         for target, col, short in [
@@ -788,6 +941,14 @@ def _print_best_trial(study: optuna.Study) -> None:
 
     best = study.best_trial
     print(f'\nBest trial: #{best.number}   score={best.value:.4f}')
+    print(f'  Score mode/history: {best.user_attrs.get("score_mode", "unknown")}  '
+          f'auc_weight={best.user_attrs.get("auc_weight", float("nan"))}  '
+          f'mcc_weight={best.user_attrs.get("mcc_weight", float("nan"))}  '
+          f'weakest_target_weight={best.user_attrs.get("weakest_target_weight", float("nan"))}  '
+          f'history={best.user_attrs.get("score_history", [])}  '
+          f'tail_mean={best.user_attrs.get("tail_mean_score", float("nan")):.4f}  '
+          f'tail_std={best.user_attrs.get("tail_std_score", float("nan")):.4f}  '
+          f'trend={best.user_attrs.get("score_trend", float("nan")):.4f}')
     print(f'  FAB portScore:           auc={best.user_attrs.get("fab_val_auc", float("nan")):.4f}  '
           f'mcc={best.user_attrs.get("fab_val_mcc", float("nan")):.4f}')
     print(f'  DEVCOM bot_dist:         auc={best.user_attrs.get("bot_val_auc", float("nan")):.4f}  '
@@ -914,7 +1075,8 @@ def build_final_cmd_tsjepa(params: dict, gpu: int, profile: dict, final_epochs: 
     return cmd
 
 
-def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs: int) -> list[str]:
+def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs: int,
+                             kinematics: str = 'P') -> list[str]:
     """Build train_vr_encoder_pose_jepa.py command for the final model (eval_split_mode=test).
 
     params is raw Optuna best.params. If it contains 'model_shape', expand the
@@ -951,7 +1113,7 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--warmup_epochs',      str(_warmup_epochs_posejepa(final_epochs)),
         '--val_fraction',       '0.15',
         '--min_lr',             str(params.get('min_lr', 1e-6)),
-        '--kinematics',         'PVAJ',
+        '--kinematics',         kinematics,
         '--samples_per_epoch',  str(params.get('samples_per_epoch', 0)),
         '--seed',               str(_FIXED_SEED),
         '--no_compile',
@@ -971,8 +1133,8 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
         '--pred_ffn_dim',       str(pred_ffn_dim),
         '--latent_loss',        params.get('latent_loss', 'smooth_l1'),
         '--embed_pool',         'mean',
-        '--lr',                 str(params['lr']),
-        '--weight_decay',       str(params.get('weight_decay', 1e-4)),
+        '--lr',                 str(_param_alias(params, 'lr', 'lr_cont')),
+        '--weight_decay',       str(_param_alias(params, 'weight_decay', 'weight_decay_cont', 1e-4)),
         '--sampling_alpha',     str(params['sampling_alpha']),
         '--dropout',            str(params.get('dropout', 0.0)),
         '--embed_dim',          str(embed_dim),
@@ -984,7 +1146,7 @@ def build_final_cmd_posejepa(params: dict, gpu: int, profile: dict, final_epochs
 
 
 def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: int,
-                    objective: str = 'mae') -> None:
+                    objective: str = 'mae', kinematics: str = 'P') -> None:
     """
     Phase 2: train a fresh model for final_epochs using the best hyperparameters,
     evaluating on the test split every 5 epochs.
@@ -1007,7 +1169,7 @@ def run_final_phase(study: optuna.Study, gpu: int, profile: dict, final_epochs: 
     if objective == 'tsjepa':
         cmd = build_final_cmd_tsjepa(params, gpu, profile, final_epochs)
     elif objective == 'posejepa':
-        cmd = build_final_cmd_posejepa(params, gpu, profile, final_epochs)
+        cmd = build_final_cmd_posejepa(params, gpu, profile, final_epochs, kinematics)
     else:
         cmd = build_final_cmd(params, gpu, profile, final_epochs)
     rc, stdout = _run_streaming(cmd, env)
@@ -1113,6 +1275,31 @@ def parse_args():
                    help='Epochs per trial subprocess. Defaults: mae/tsjepa=10, posejepa=100.')
     p.add_argument('--eval_interval',  type=int, default=None,
                    help='embed_eval_interval per trial subprocess. Defaults: mae/tsjepa=10, posejepa=20.')
+    p.add_argument('--kinematics',     type=str, default='P',
+                   help='Kinematic channels passed to posejepa trials (default: P). '
+                        'Examples: P, PVAJ. Has no effect for mae/tsjepa objectives.')
+    p.add_argument('--score_mode',     type=str, default='stable_tail',
+                   choices=['stable_tail', 'mean_tail', 'last'],
+                   help='How per-eval aggregate probe scores become the Optuna trial value. '
+                        'stable_tail rewards sustained recent performance; last preserves '
+                        'the old final-checkpoint behavior. Default: stable_tail.')
+    p.add_argument('--auc_weight',     type=float, default=0.5,
+                   help='Weight for AUROC in each per-target probe score (default: 0.5).')
+    p.add_argument('--mcc_weight',     type=float, default=0.5,
+                   help='Weight for rescaled MCC in each per-target probe score '
+                        '(default: 0.5).')
+    p.add_argument('--weakest_target_weight', type=float, default=0.25,
+                   help='Blend weight for the weakest per-target score after harmonic '
+                        'mean aggregation. 0 disables; 0.25 is the default.')
+    p.add_argument('--score_tail_k',   type=int, default=3,
+                   help='Number of recent probe evals used by stable_tail/mean_tail '
+                        '(default: 3).')
+    p.add_argument('--volatility_penalty', type=float, default=0.5,
+                   help='Penalty multiplier for std(last K scores) in stable_tail '
+                        '(default: 0.5).')
+    p.add_argument('--trend_weight',   type=float, default=0.1,
+                   help='Weight for final-minus-first probe score in stable_tail '
+                        '(default: 0.1).')
     p.add_argument('--trial_timeout',  type=int, default=1500,
                    help='Per-trial subprocess timeout in seconds (default: 1500). '
                         'Increase for slower GPUs running long-epoch objectives '
@@ -1121,9 +1308,18 @@ def parse_args():
                    help='Disable Optuna MedianPruner early stopping. By default, trials '
                         'whose intermediate scores fall below the median of prior trials '
                         'are pruned (most impactful for posejepa with 5 eval checkpoints).')
-    p.add_argument('--pruner_startup', type=int, default=5,
+    p.add_argument('--pruner_startup', type=int, default=20,
                    help='Number of completed trials before the pruner starts pruning '
-                        '(default: 5). Passed as n_startup_trials to MedianPruner.')
+                        '(default: 20). Passed as n_startup_trials to MedianPruner.')
+    p.add_argument('--sampler_startup', type=int, default=40,
+                   help='Number of random startup trials for TPE before model-based '
+                        'sampling begins (default: 40).')
+    p.add_argument('--n_ei_candidates', type=int, default=64,
+                   help='Number of expected-improvement candidates sampled by TPE '
+                        '(default: 64).')
+    p.add_argument('--no_multivariate_tpe', action='store_true',
+                   help='Disable multivariate/group TPE. Enabled by default to model '
+                        'parameter interactions and reduce brittle one-parameter collapse.')
     return p.parse_args()
 
 
@@ -1146,11 +1342,27 @@ def main():
             interval_steps=1,
         )
 
-    study = create_study(args.study_name, args.worker_offset, args.storage, pruner=pruner)
+    study = create_study(
+        args.study_name,
+        args.worker_offset,
+        args.storage,
+        pruner=pruner,
+        sampler_startup=args.sampler_startup,
+        n_ei_candidates=args.n_ei_candidates,
+        multivariate_tpe=not args.no_multivariate_tpe,
+    )
 
     existing = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     print(f'Study: {args.study_name}')
     print(f'Objective: {args.objective}')
+    print(f'Probe score weights: auc={args.auc_weight}, mcc={args.mcc_weight}, '
+          f'weakest_target={args.weakest_target_weight}')
+    print(f'Score mode: {args.score_mode} '
+          f'(tail_k={args.score_tail_k}, volatility_penalty={args.volatility_penalty}, '
+          f'trend_weight={args.trend_weight})')
+    print(f'TPE sampler: startup={args.sampler_startup}, '
+          f'n_ei_candidates={args.n_ei_candidates}, '
+          f'multivariate_group={not args.no_multivariate_tpe}')
     print(f'Early stopping: {"disabled" if args.no_early_stopping else f"MedianPruner (startup={args.pruner_startup}, warmup=1)"}')
     print(f'Existing completed trials: {existing}')
     print(f'GPU: {args.gpu}   Trials to run: {args.n_trials}')
@@ -1160,7 +1372,15 @@ def main():
                                      objective=args.objective,
                                      trial_timeout=args.trial_timeout,
                                      trial_epochs=args.trial_epochs,
-                                     eval_interval=args.eval_interval)
+                                     eval_interval=args.eval_interval,
+                                     kinematics=args.kinematics,
+                                     auc_weight=args.auc_weight,
+                                     mcc_weight=args.mcc_weight,
+                                     weakest_target_weight=args.weakest_target_weight,
+                                     score_mode=args.score_mode,
+                                     score_tail_k=args.score_tail_k,
+                                     volatility_penalty=args.volatility_penalty,
+                                     trend_weight=args.trend_weight)
 
     t_start = time.time()
     try:
@@ -1182,7 +1402,7 @@ def main():
     _print_best_trial(study)
 
     if not args.skip_final:
-        run_final_phase(study, args.gpu, profile, args.final_epochs, args.objective)
+        run_final_phase(study, args.gpu, profile, args.final_epochs, args.objective, args.kinematics)
 
 
 if __name__ == '__main__':

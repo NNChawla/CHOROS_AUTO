@@ -185,8 +185,9 @@ def run_classification_split(
     """
     Fit linear classifier on train (C and penalty via LOGO or LOO), evaluate on eval.
     Returns (y_pred, pos_scores_1d, metrics_dict).
-    pos_scores_1d is decision_function (SVC) or predict_proba[:,1] (LogReg) for binary,
-    or None for the skipped case.
+    pos_scores_1d is a continuous positive-class ranking score for binary AUROC:
+    decision_function for LinearSVC or predict_proba[:, positive_class] for LogReg.
+    It is not thresholded before roc_auc_score.
     """
     actual_train_classes = np.unique(y_train)
     actual_eval_classes  = np.unique(y_eval)
@@ -218,7 +219,7 @@ def run_classification_split(
 
     y_pred = model.predict(X_eval)
 
-    # Ranking scores: decision_function for SVC, predict_proba for LogReg
+    # Ranking scores for threshold-independent ROC-AUC.
     if classifier == "svc":
         scores = model.decision_function(X_eval)  # 1D binary or 2D multiclass
     else:
@@ -406,7 +407,7 @@ def run_probe(
                   f"train low={(y_train_med==0).sum()} high={(y_train_med==1).sum()}  "
                   f"eval low={(y_eval_med==0).sum()} high={(y_eval_med==1).sum()}")
 
-        pred_med, prob_med, med_metrics, med_C, med_penalty = run_classification_split(
+        pred_med, score_med, med_metrics, med_C, med_penalty = run_classification_split(
             "Median-split (binary)", X_train, y_train_med,
             X_eval, y_eval_med, n_classes=2, groups_train=groups_train,
             eval_split_name=eval_split, classifier=classifier,
@@ -493,7 +494,9 @@ def run_probe(
         out["pred_regression"] = y_pred_reg
         out["label_median"]    = y_eval_med
         out["pred_median"]     = pred_med
-        out["prob_med_pos"]    = prob_med if prob_med is not None else np.nan
+        out["score_med_pos"]   = score_med if score_med is not None else np.nan
+        # Backward-compatible alias: for LinearSVC this is a margin, not a probability.
+        out["prob_med_pos"]    = out["score_med_pos"]
         out["label_quartile"]  = y_eval_qrt
         out["pred_quartile"]   = pred_qrt
         out["target_col"]      = target_display
